@@ -292,10 +292,14 @@ fn usage_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         return Vec::new();
     }
 
-    // Claude Code refreshes that cache; fleet only reads it. Numbers nobody has
-    // refreshed in a while should say so rather than look current.
-    let stale = (u.fetched_ago > USAGE_STALE)
-        .then(|| format!("{} ago ", fmt_uptime(u.fetched_ago)));
+    // Claude Code refreshes that cache; fleet only reads it — but it does ask
+    // for a refresh when the numbers go stale, and that ask is worth showing:
+    // the age stops moving for a moment and then jumps.
+    let stale = if app.usage_refreshing() {
+        Some("refreshing ".to_string())
+    } else {
+        (u.fetched_ago > USAGE_STALE).then(|| format!("{} ago ", fmt_uptime(u.fetched_ago)))
+    };
     let title = " LIMITS";
     let used = title.chars().count() + stale.as_ref().map_or(0, |s| s.chars().count());
     let mut head = vec![
@@ -871,7 +875,9 @@ fn draw_help(f: &mut Frame) {
         ("", "(finished ones go by themselves after a minute)"),
         ("r", "restart into a new build (when a newer exe exists)"),
         ("", "(sessions come back with their conversations, --resume)"),
-        ("R", "resume an old conversation (transcript list)"),
+        ("R", "resume an old conversation (transcript list)"),
+        ("U", "refresh the account limits now"),
+        ("", "(a hidden /usage session, no tokens)"),
         ("q", "quit"),
         ("", ""),
         ("", "-- FOCUS --"),

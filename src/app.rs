@@ -3,7 +3,7 @@
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
     time::{Duration, Instant, SystemTime},
@@ -27,6 +27,20 @@ const REGISTRY_REFRESH: Duration = Duration::from_millis(750);
 /// How often the binary this fleet was started from is checked for a rebuild.
 /// It is one `stat` and nobody rebuilds twice a second.
 const EXE_CHECK: Duration = Duration::from_millis(1000);
+
+/// The shortest gap between two refreshes of the limit cache, used while our own
+/// sessions are burning through it.
+///
+/// Six minutes, because Claude Code answers `/usage` from numbers it already
+/// has for about five: asking inside that window spawns a child that reads the
+/// dialog and changes nothing. A refresh costs no tokens, but it is still a
+/// process.
+const USAGE_REFRESH_MIN: Duration = Duration::from_secs(6 * 60);
+
+/// The longest the numbers are left alone when nothing here has run since they
+/// were fetched. Usage can still move elsewhere — another machine, claude.ai —
+/// so the cache is not left to rot either.
+const USAGE_REFRESH_MAX: Duration = Duration::from_secs(30 * 60);
 
 /// How long a finished session's card stays on the list before the fleet drops
 /// it by itself, and how long the `u` chord stays armed after landing in a
@@ -159,6 +173,18 @@ pub struct App {
     last_exe_check: Instant,
     /// The account's rate-limit windows, as Claude Code last cached them.
     pub usage: usage::Watch,
+    /// The pid of the hidden session refreshing those numbers, or zero when no
+    /// refresh is in flight. It is what keeps that child off the session list.
+    usage_refresh: Arc<AtomicU32>,
+    /// Set while the refresh thread is alive, so only one runs at a time.
+    usage_refreshing: Arc<AtomicBool>,
+    /// When the last refresh was started, successful or not.
+    last_usage_refresh: Option<Instant>,
+    /// Whether one of our own sessions has been busy since the numbers were
+    /// last fetched. Nothing of ours running means nothing of ours spending,
+    /// which is the difference between asking every six minutes and every half
+    /// hour.
+    spent_since_refresh: bool,
 }
 
 impl App {
@@ -186,6 +212,10 @@ impl App {
             restart_requested: false,
             update_ready: false,
             usage: usage::Watch::new(),
+            usage_refresh: Arc::new(AtomicU32::new(0)),
+            usage_refreshing: Arc::new(AtomicBool::new(false)),
+            last_usage_refresh: None,
+            spent_since_refresh: false,
             origin_stamp: supervise::origin_stamp(),
             last_exe_check: Instant::now(),
         }
@@ -207,10 +237,80 @@ impl App {
     /// Foreign sessions: everything in the registry we did not spawn.
     pub fn foreign(&self) -> Vec<&RegistryEntry> {
         let own: Vec<u32> = self.sessions.iter().filter_map(|s| s.child_pid).collect();
+        // The session refreshing the limits registers itself like any other, and
+        // lives for about two seconds. Showing it would be the panel reporting
+        // its own bookkeeping as somebody's work.
+        let hidden = self.usage_refresh.load(Ordering::Relaxed);
         self.registry
             .iter()
-            .filter(|e| !own.contains(&e.pid))
+            .filter(|e| !own.contains(&e.pid) && e.pid != hidden)
             .collect()
+    }
+
+    /// Whether any session we own is reported as working right now.
+    fn any_own_busy(&self) -> bool {
+        self.sessions
+            .iter()
+            .filter_map(|s| s.child_pid)
+            .filter_map(|pid| registry::find_by_pid(&self.registry, pid))
+            .any(|e| e.status == "busy")
+    }
+
+    /// True while a hidden session is fetching new limit numbers.
+    pub fn usage_refreshing(&self) -> bool {
+        self.usage_refreshing.load(Ordering::Relaxed)
+    }
+
+    /// Start a refresh unless one is already running.
+    ///
+    /// It runs on a thread of its own: the child takes a couple of seconds to
+    /// start, answer and die, and the panel has frames to draw in the meantime.
+    pub fn refresh_usage(&mut self) {
+        if self.usage_refreshing.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        self.last_usage_refresh = Some(Instant::now());
+        let cwd = self
+            .selected_session()
+            .map(|s| s.cwd.clone())
+            .unwrap_or_else(|| self.launch_cwd.clone());
+        let pid = Arc::clone(&self.usage_refresh);
+        let busy = Arc::clone(&self.usage_refreshing);
+        let dirty = Arc::clone(&self.dirty);
+        std::thread::spawn(move || {
+            // A refresh that changes nothing is an ordinary outcome and says
+            // nothing worth interrupting anyone for: the next attempt is five
+            // minutes away regardless.
+            let _ = usage::refresh_via_claude(&cwd, &pid);
+            busy.store(false, Ordering::Relaxed);
+            dirty.store(true, Ordering::Relaxed);
+        });
+    }
+
+    /// Whether the numbers are old enough to be worth a child process.
+    ///
+    /// Two clocks: a short one while our own sessions are spending the limits,
+    /// and a long one when nothing here has run since the last fetch.
+    fn usage_refresh_due(&self) -> bool {
+        if self.usage_refreshing() {
+            return false;
+        }
+        if let Some(at) = self.last_usage_refresh
+            && at.elapsed() < USAGE_REFRESH_MIN
+        {
+            return false;
+        }
+        let Some(u) = self.usage.current.as_ref() else {
+            // No cache at all: nothing to go stale, and one fetch gives the
+            // footer something to draw.
+            return true;
+        };
+        let age = u.fetched_ago;
+        if self.spent_since_refresh {
+            age >= USAGE_REFRESH_MIN
+        } else {
+            age >= USAGE_REFRESH_MAX
+        }
     }
 
     /// The registry entry describing one of our own sessions, if it has
@@ -652,7 +752,16 @@ impl App {
             // Same cadence as the registry: the limits move slowly, and their
             // countdowns only need to be right to the minute on screen.
             if self.usage.refresh() {
+                self.spent_since_refresh = false;
                 self.dirty.store(true, Ordering::Relaxed);
+            }
+            // A session of ours that is working is spending the limits the
+            // footer is showing, so the numbers on screen are already wrong.
+            if self.any_own_busy() {
+                self.spent_since_refresh = true;
+            }
+            if self.usage_refresh_due() {
+                self.refresh_usage();
             }
         }
 
@@ -696,6 +805,82 @@ mod tests {
         // `u` that meant nothing of the sort.
         let _ = app.take_understand_window();
         assert!(app.understand_window.is_none());
+    }
+
+    fn aged(secs: u64) -> usage::Usage {
+        usage::Usage {
+            session: None,
+            weekly: None,
+            fetched_ago: Duration::from_secs(secs),
+        }
+    }
+
+    #[test]
+    fn limits_are_refreshed_sooner_when_our_own_sessions_are_spending_them() {
+        let mut app = app();
+
+        // Nothing of ours has run, so numbers this age are probably still right.
+        app.usage.current = Some(aged(10 * 60));
+        app.spent_since_refresh = false;
+        assert!(!app.usage_refresh_due());
+
+        // The same age, with a session of ours working since they were fetched:
+        // whatever is on screen is already out of date.
+        app.spent_since_refresh = true;
+        assert!(app.usage_refresh_due());
+    }
+
+    #[test]
+    fn an_idle_fleet_still_asks_eventually() {
+        let mut app = app();
+        app.spent_since_refresh = false;
+        app.usage.current = Some(aged(31 * 60));
+        // Usage moves on other machines too, so the long clock exists.
+        assert!(app.usage_refresh_due());
+    }
+
+    #[test]
+    fn numbers_fresher_than_claude_codes_own_cache_are_left_alone() {
+        let mut app = app();
+        app.spent_since_refresh = true;
+        // Asking again this soon spawns a child that changes nothing: Claude
+        // Code would answer `/usage` from what it already has.
+        app.usage.current = Some(aged(60));
+        assert!(!app.usage_refresh_due());
+    }
+
+    #[test]
+    fn one_refresh_at_a_time_and_not_twice_in_a_row() {
+        let mut app = app();
+        app.spent_since_refresh = true;
+        app.usage.current = Some(aged(60 * 60));
+        assert!(app.usage_refresh_due());
+
+        // An attempt just made rules out the next one, whatever the age says:
+        // the stamp only moves when Claude Code decides to fetch.
+        app.last_usage_refresh = Some(Instant::now());
+        assert!(!app.usage_refresh_due());
+
+        app.last_usage_refresh = None;
+        app.usage_refreshing.store(true, Ordering::Relaxed);
+        assert!(!app.usage_refresh_due());
+    }
+
+    #[test]
+    fn the_session_doing_the_refreshing_is_not_shown_as_somebody_elses() {
+        let mut app = app();
+        app.registry = vec![RegistryEntry {
+            pid: 4242,
+            cwd: ".".into(),
+            name: "usage".into(),
+            status: "idle".into(),
+            waiting_for: String::new(),
+            started_at: 0,
+        }];
+        assert_eq!(app.foreign().len(), 1);
+
+        app.usage_refresh.store(4242, Ordering::Relaxed);
+        assert!(app.foreign().is_empty());
     }
 
     #[test]

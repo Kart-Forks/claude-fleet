@@ -58,6 +58,7 @@ transcript instead.
 | `Enter` / `Tab` | enter the session |
 | `n` | new session |
 | `R` | resume an old conversation (see below) |
+| `U` | refresh the account limits now (see below) |
 | `u` | understand project (see below) |
 | `r` | restart into a new build (see below) |
 | `x` | kill the selected session (with a confirmation) |
@@ -286,7 +287,8 @@ claude-fleet --help        help
 
 Diagnostics: `--pipes` (names of the open pipes), `--selftest [ui]` (run
 `claude` under a PTY and show its screen), `--selftest understand` (check that
-queued text really reaches the child's prompt), `--raw <prog> [args]` (raw
+queued text really reaches the child's prompt), `--selftest usage` (ask Claude
+Code for fresh limit numbers once and report what happened), `--raw <prog> [args]` (raw
 bytes from any program under a PTY), `--mouse` (whether this terminal hands
 wheel events to the application at all), `--usage` (account limits as the
 sidebar reads them), `--history` (conversations to resume, as the `R` list
@@ -332,12 +334,53 @@ The file is over a hundred kilobytes and almost never changes, so it is parsed
 only when its mtime moves; the countdown to a reset is computed from what has
 already been parsed, on every list refresh.
 
-Claude Code refreshes that cache, not fleet. When nobody has touched it for
-more than twenty minutes, the heading says `1h ago` instead of pretending the
-numbers are current. When a reset time has passed, the whole row goes faint and
-the time column says `stale` — the percentage then describes a window that is
-over. With no cache at all (before the first login, say) the footer is not
-drawn.
+When a reset time has passed, the whole row goes faint and the time column says
+`stale` — the percentage then describes a window that is over. With no cache at
+all (before the first login, say) the footer is not drawn.
+
+### Keeping the numbers current
+
+Only Claude Code writes that cache, and it writes it when it feels like it — on
+a quiet machine the numbers can be hours old, which is a percentage that means
+nothing. So when they go stale, fleet asks for new ones the only way that is
+documented: it drives a session the way a person would.
+
+A hidden `claude` is spawned under a PTY exactly like any other session, `/usage`
+is typed into it, and fleet waits for `fetchedAtMs` in `~/.claude.json` to move.
+Then the child is killed. It takes about two seconds. `/usage` is a slash
+command, so Claude Code answers it itself: `total_cost_usd` is `0`, `num_turns`
+is `0` — the refresh costs no tokens.
+
+Fleet stays a reader throughout. It does not know the usage endpoint, holds no
+token, and writes nothing into the cache — the numbers are put there by Claude
+Code, with absolute `resets_at` times in them, as always.
+
+Two clocks decide when to ask:
+
+| situation | asked again after |
+|---|---|
+| a session of ours has been working since the last fetch | 6 minutes |
+| nothing here has run since then | 30 minutes |
+
+Nothing running means nothing of ours spending, and the long clock is there only
+because usage can move elsewhere — another machine, claude.ai. `U` asks straight
+away.
+
+While the hidden session is alive the footer heading says `refreshing`, and that
+session is kept off the list: it registers itself like any other, and showing it
+would be the panel reporting its own bookkeeping as somebody's work.
+
+An attempt that changes nothing is normal. Claude Code answers `/usage` from
+numbers of its own for a few minutes before it asks upstream again, so a cache
+that is already recent sits still — which is why the short clock is six minutes
+and not one. Nothing is reported when that happens; the next attempt is five
+minutes out anyway.
+
+`claude-fleet --selftest usage` runs one attempt and prints what it did, with
+the hidden session's screen when nothing moved.
+
+When nobody has refreshed the numbers for more than twenty minutes, the heading
+says `1h ago` instead of pretending they are current.
 
 The percentage follows the usage: green up to 50%, yellow up to 85%, red above
 that. The bar itself is the accent colour — its length says what the colour

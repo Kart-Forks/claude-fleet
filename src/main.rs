@@ -485,6 +485,53 @@ fn source_selftest() -> Result<()> {
     Ok(())
 }
 
+/// Drive the hidden `/usage` session once and say whether the cache moved.
+/// Answers "can fleet refresh the limits itself" without waiting for the panel
+/// to decide the numbers are stale.
+fn usage_selftest() -> Result<()> {
+    use std::sync::atomic::AtomicU32;
+
+    let watch = usage::Watch::new();
+    match watch.current.as_ref() {
+        Some(u) => println!("before: refreshed {} ago", fmt_ago(u.fetched_ago)),
+        None => println!("before: no cache at all"),
+    }
+
+    let age_before = watch.current.as_ref().map(|u| u.fetched_ago);
+
+    let pid = AtomicU32::new(0);
+    let r = usage::refresh_via_claude(&env::current_dir()?, &pid)?;
+    println!("cache moved={} after {:?}", r.moved, r.waited);
+
+    let watch = usage::Watch::new();
+    match watch.current.as_ref() {
+        Some(u) => println!("after:  refreshed {} ago", fmt_ago(u.fetched_ago)),
+        None => println!("after:  no cache at all"),
+    }
+    if !r.moved {
+        // Claude Code answers `/usage` from numbers of its own for a few
+        // minutes, so a cache that was recent to begin with is expected to sit
+        // still. Only an old one that would not move is a failure.
+        println!("--- hidden session screen ---");
+        println!("{}", r.screen.trim_end());
+        println!("--- end ---");
+        if age_before.is_some_and(|a| a < TTL_GUESS) {
+            println!(
+                "numbers were only {} old; Claude Code answered from its own cache",
+                fmt_ago(age_before.unwrap_or_default())
+            );
+            return Ok(());
+        }
+        anyhow::bail!("the cache did not move");
+    }
+    Ok(())
+}
+
+/// About how long Claude Code serves `/usage` from numbers it already has. Not
+/// documented anywhere, so it is an observation, and it is only used to tell an
+/// expected non-refresh from a broken one.
+const TTL_GUESS: Duration = Duration::from_secs(5 * 60);
+
 /// Watch the config file the way the running fleet does, and report every
 /// reload it sees. Answers "is my edit reaching it at all" without a TUI in
 /// the way.
@@ -574,6 +621,9 @@ fn selftest(kind: Option<&str>) -> Result<()> {
     }
     if kind == Some("restart") {
         return restart_selftest();
+    }
+    if kind == Some("usage") {
+        return usage_selftest();
     }
 
     let interactive = matches!(kind, Some("ui" | "understand"));
@@ -1003,6 +1053,16 @@ fn handle_nav(app: &mut App, key: KeyEvent) {
                 app.close_selected();
             } else {
                 app.notify("the session is still alive — x first");
+            }
+        }
+        // Shift, for the same reason `R` is: `u` next to it arms the chord, and
+        // this one spawns a process rather than typing into one.
+        KeyCode::Char('U') => {
+            if app.usage_refreshing() {
+                app.notify("limits are already being refreshed");
+            } else {
+                app.refresh_usage();
+                app.notify("asking Claude Code for fresh limits");
             }
         }
         KeyCode::Char('?') => app.mode = Mode::Help,
