@@ -1,0 +1,430 @@
+# claude-fleet
+
+A terminal multiplexer for Claude Code sessions. The left pane is the session
+list, the right one is the full, interactive terminal of the selected session.
+
+```
+┌─ SESSIONS ────┬─ api-a6 ────────────────────────────┐
+│ * piotr-c3    │ > fix the test in auth.spec.ts      │
+│   .           │                                     │
+│ o api-a6  ◀   │ ⏺ Read(src/auth.spec.ts)            │
+│   apps/api    │   ⎿ Read 120 lines                  │
+│               │                                     │
+│ --- UNREACHABLE                                     │
+│ ! smartwood…  │ ✻ Thinking… (7s · ↑ 1.2k tokens)    │
+├───────────────┴─────────────────────────────────────┤
+│ [F10] LEAVE FOCUS   F1-F9 session   F11 new         │
+└─────────────────────────────────────────────────────┘
+```
+
+## How it works
+
+Fleet is a **supervisor**: it spawns every session itself, as a child process
+under a ConPTY of its own. That is what makes the pane fully interactive — keys
+go straight to the child's stdin, and its output runs through a `vt100`
+emulator.
+
+Sessions started **outside** fleet are visible in the list, but greyed out and
+marked `!`. Their PTY belongs to another terminal and on Windows there is no
+taking it over. Fleet only reads their metadata.
+
+## How fleet learns about sessions
+
+Claude Code keeps a local registry, of which fleet is strictly a reader:
+
+| path | contents |
+|---|---|
+| `~/.claude/sessions/<pid>.json` | name, cwd, `status` (`busy`/`idle`/`waiting`), `waitingFor`, `sessionId`, `messagingSocketPath` |
+| `~/.claude/sessions/<pid>.<sha>.key` | `peerToken` for the pipe |
+| `~/.claude/projects/<slug>/<sessionId>.jsonl` | transcript, append-only |
+| `~/.claude.json` | `cachedUsageUtilization` — account limits and reset times |
+| `\\.\pipe\LOCAL\cc-msg-<hash>` | named pipe, the one `SendMessage` runs over |
+
+A registry file survives a process that was killed outright, so **liveness is
+decided by whether the pipe exists**, not by the file.
+
+The "recent projects" list in the new-session dialog does not decode the
+directory names under `projects/` — that slug is lossy (`-` is both a separator
+and a character inside names). Fleet reads the `cwd` field from the newest
+transcript instead.
+
+## Shortcuts
+
+**Navigation** (left pane focused)
+
+| key | action |
+|---|---|
+| `↑` `↓` / `j` `k` | select a session |
+| `Enter` / `Tab` | enter the session |
+| `n` | new session |
+| `R` | resume an old conversation (see below) |
+| `u` | understand project (see below) |
+| `r` | restart into a new build (see below) |
+| `x` | kill the selected session (with a confirmation) |
+| `w` | close a finished session's card right away |
+| `?` | help |
+| `q` | quit |
+
+## Session state on a card
+
+A card shows what the session reports in the registry:
+
+| badge | means |
+|---|---|
+| `working` (yellow) | `status: busy` — the model is working |
+| `idle` (green) | `status: idle` — nothing is happening |
+| **`question` (blue)** | `status: waiting` — the session is stopped on a question and will not move until someone answers |
+| `starting` (grey) | the process is up, but has not written its registry entry yet |
+
+`waiting` is a third status, not a flavour of `idle`: it belongs to a session
+that has opened a dialog, a permission prompt, or is waiting on a choice. The
+registry carries a `waitingFor` field with it (`dialog open`, `input needed`,
+`permission prompt`) — the pane border prints it next to `QUESTION`, and
+`--list` prints it in brackets after the status.
+
+A finished session's card disappears by itself **a minute after the process
+exits** — until then the list counts down with `gone in 42s`. `w` closes it
+sooner.
+
+**Focus** (keys go to Claude)
+
+| key | action |
+|---|---|
+| **`F10`** | **leave focus** |
+| everything else | goes to Claude, including `Ctrl+anything` |
+| mouse wheel | scroll the history (see "Scrolling") |
+
+## Pasting
+
+PTY input is queued and pushed out in 8 KB chunks by a writer thread of its
+own, so pasting a megabyte does not stall the UI — the pane keeps redrawing,
+`F10` still leaves focus, and the pane border shows `pasting 1.4 MB` counting
+the rest of the queue down.
+
+Terminal input is read by a dedicated thread — nothing else touches the event
+queue. The console input queue is a fixed-size ring, and records that land in
+it while nobody is reading are lost without a trace. Reading from the event
+loop meant every redraw dropped a piece of the paste — mid-word.
+
+crossterm only assembles `Event::Paste` from the Unix input stream, so on
+Windows a paste **always** arrives as an avalanche of key presses. Fleet
+therefore collects a burst of plain characters (up to 64 KB per chunk) and
+sends it as one paste. More than 8 characters in a burst is a paste, fewer is
+typing. Modified keys, arrows and function keys never join such a burst.
+
+A burst does not end at the first empty queue. A paste does not arrive in one
+run but in waves with gaps between them; cutting at the first gap split a
+single prompt into dozens of pieces, and every piece outside the paste brackets
+sends itself on its own `\n`. A silence shorter than 60 ms therefore still
+belongs to the burst.
+
+A paste too large for one chunk goes out in several, but the `ESC[200~` /
+`ESC[201~` brackets belong to the whole, not to a chunk: opened on the first,
+closed on the last. While a paste is open, every input is its continuation —
+including a tail shorter than 8 characters that fell just outside the silence
+window. The first real key press closes it.
+
+**Always** (in every mode)
+
+| key | action |
+|---|---|
+| `F1`-`F9` | jump to a session — selects it and enters focus at once |
+| `F<n+1>` | the first free slot starts a new session right away |
+| `F11` | new session (with the dialog) |
+| `F12` | help |
+
+With two sessions, `F1` and `F2` jump, and `F3` — the first free slot — starts a
+third session with no dialog at all, in the selected session's directory.
+Further keys (`F4` and up) say which slot is next. The dialog with the
+directory picker is on `F11` and `n`.
+
+When the path typed into the dialog does not point at an existing directory,
+fleet asks `create it?` — `y`/`enter` creates it (with any missing parents) and
+starts the session, `n`/`esc` returns to the form with the path still in place.
+
+Only the function keys are reserved — no fleet shortcut sits on a modifier.
+Claude Code binds plenty of `Ctrl` combinations itself (`Ctrl+B` for background
+tasks, among others), so a tmux-style prefix would swallow keys meant for the
+session. The `u` in the section below is a sequence of plain keys rather than a
+combination, and outside focus mode there is nothing to swallow anyway.
+Since the function keys work everywhere regardless, there is always a way out
+of a pane that is eating input.
+
+`F10` is printed on the pane border in focus mode, not only in the help.
+
+## understand project
+
+`u` puts the text `understand project` into the prompt of the selected or a new
+session — **without pressing enter**. The text lands in the box; adding details
+and sending it stays with the human.
+
+The chord works in both directions, because that is how people reach for it:
+
+| sequence | effect |
+|---|---|
+| `u` `F1`..`F9` | that session; a free slot = a new session and the prompt right away |
+| `u` `u` | new session in the first free slot, no directory dialog |
+| `u` `n` | new session with the directory dialog |
+| `u` `enter` | the selected session |
+| `F1`..`F9`, then `u` | the same thing, the other way round |
+
+Once `u` is armed, **every** key is an answer: it either names a target or
+cancels the chord. An accidental press therefore starts no session and kills
+nobody.
+
+The reverse order runs on a time window: for 2 seconds after entering a
+session, a lone `u` is the chord rather than a letter. Lone — a `u` that starts
+a word arrives in a burst with the other letters and goes to Claude as usual.
+
+A session spawned a moment ago has no prompt box yet and loses anything typed
+into it, so the text waits in the session and goes in when `❯` appears on
+screen (or the box border, in older versions). Should it never appear, the text
+goes anyway after 8 seconds — a heuristic that misses has no business
+swallowing a paste forever. To check it live: `--selftest understand`.
+
+## Resuming conversations
+
+`R` in the list opens the transcripts from `~/.claude/projects` — the twenty
+most recent conversations, newest first:
+
+```
+╭ resume a conversation ──────────────────────────────────────────────╮
+│ enter resumes, esc closes                                           │
+│ > claude-fleet    make the limit progress bar bigger, add resume   2m│
+│   smartwood-api   add a date filter to the orders view             5h│
+│   KonduktorPDF    Batch Print Manager — Build Spec                 2d│
+╰─────────────────────────────────────────────────────────────────────╯
+```
+
+`Enter` starts a new session in that conversation's directory with
+`--resume <id>` — Claude Code loads the full history and keeps writing to the
+same transcript. That is the only thing fleet does here: `claude` handles all
+the rest, including the case where that conversation happens to be running
+somewhere (it starts a copy and says so).
+
+A conversation's name is its **first real user message**: no
+`<system-reminder>`, no slash-command names, no tool results and no subagent
+lines (`isSidechain`). Rows without such a message do not reach the list at all
+— a session opened and closed without a word has nothing to resume.
+
+Where the id comes from: the file name
+`~/.claude/projects/<dir-with-dashes>/<id>.jsonl` is exactly what `--resume`
+takes. The directory in that name is the working path with every non-alphanumeric
+character replaced by `-`. `claude-fleet --history` prints the same list without
+starting the panel — for when the question is "why is that conversation not
+there".
+
+## Live changes
+
+Two different things, because they cost different amounts.
+
+**Config — no restart, sessions live on.** Colours, the words on cards, the
+text of the `understand project` prompt and the timings live in
+`~/.claude/fleet.toml` (overridden by `CLAUDE_FLEET_CONFIG`). The file is
+written on the first start and belongs to you from then on — fleet never
+overwrites it. Its timestamp is checked every frame, so a save shows up in the
+next redraw; the panel says `config reloaded`.
+
+Broken TOML **does not wipe the palette**: the previous values stand and the
+status bar shows `config rejected: <error>`. A config is edited in place, and
+half a line mid-keystroke has no business blanking the screen. An unknown key
+is an error too — a typo that parsed would look like a setting with no effect.
+
+**Code — a restart; processes die, conversations do not.** `r` in the list
+restarts fleet into a new build. When sessions are alive, fleet asks first.
+The processes themselves cannot be saved: a child under a ConPTY dies with the
+process that created that pseudoconsole (`--orphan-probe` shows this), and a
+`HPCON` is not transferable between processes — there is nothing to hand over.
+Surviving processes would mean moving the PTY into a separate host process;
+that is not here.
+
+What does come back is the **conversation**. Before exiting, fleet appends the
+transcript id of every live session to a restore file, and on return starts
+them with `claude --resume <id>` — same directory, same history, new process.
+The status bar shows `3 sessions came back after the restart, with their
+conversations`. When a transcript cannot be pinned down, that session comes
+back empty and the counter in the message says so.
+
+### How that works
+
+The process you start is the **supervisor**: it copies the build output to a
+temporary file and runs that copy in the same console. A copy asking for a
+restart exits with code `75`, and the loop goes round again with whatever is
+sitting at the build path by then. They never run at the same time, so nothing
+fights over the terminal.
+
+The copy is the point of the whole construction: **a running exe is locked on
+Windows**, so a fleet started straight out of `target` breaks the next
+`cargo build`. The supervisor does keep **its own** file open, though, so the
+two paths have to differ:
+
+```
+claude-fleet.exe                     <- what you run (the supervisor)
+target/release/claude-fleet.exe      <- what it watches and copies from
+```
+
+With that layout fleet finds the build output by itself — it takes the newer of
+`target/release` and `target/debug` next to it. `CLAUDE_FLEET_BUILD` points at
+it by hand. When the two are the same file, fleet says so at startup, because
+no copying further down will help then.
+
+The working loop therefore looks like this: `build.cmd build --release`, fleet
+notices the new file within a second and prints `new build ready`, `r` moves
+into the new version. Nothing has to be copied by hand.
+
+Copies left behind by a fleet that was killed rather than closed are cleaned up
+by the next start: trying to delete one is at the same time the test of whether
+it is still running — Windows will not delete a running file.
+
+## Running
+
+```
+claude-fleet [DIR]         TUI, current directory by default
+claude-fleet --list        print the running sessions and exit
+claude-fleet --help        help
+```
+
+Diagnostics: `--pipes` (names of the open pipes), `--selftest [ui]` (run
+`claude` under a PTY and show its screen), `--selftest understand` (check that
+queued text really reaches the child's prompt), `--raw <prog> [args]` (raw
+bytes from any program under a PTY), `--mouse` (whether this terminal hands
+wheel events to the application at all), `--usage` (account limits as the
+sidebar reads them), `--history` (conversations to resume, as the `R` list
+reads them).
+
+`--raw` answers DSR itself — otherwise the child stalls at startup and the
+probe shows exactly the four bytes you are asking about (see pitfall 1).
+
+## Building
+
+```
+build.cmd build --release
+```
+
+`build.cmd` is a thin wrapper around `cargo` — see below for why it is needed.
+
+## Account limits
+
+Two bars sit at the bottom of the left pane: the five-hour window (`session`)
+and the seven-day one (`weekly`), each with a percentage spent and the time
+until it resets.
+
+```
+ LIMITS
+ session                    21%   3h44m
+ ██████▌░░░░░░░░░░░░░░░░░░░░░░░░
+ weekly                     31%  11h34m
+ █████████▉░░░░░░░░░░░░░░░░░░░░░
+```
+
+The bar runs the full width of the pane, on a line of its own under the
+numbers. The fill is counted in eighths of a block (`▏▎▍▌▋▊▉█`), so movement
+shows between whole cells — otherwise the bar would stand still for a quarter
+of an hour at a time.
+
+These are the same numbers `/usage` shows in Claude Code, and fleet **asks
+nobody for them**: Claude Code keeps them in `~/.claude.json` under
+`cachedUsageUtilization`, together with each window's `resets_at` and a
+`fetchedAtMs` stamp. Fleet is a reader here exactly as it is for the session
+registry.
+
+The file is over a hundred kilobytes and almost never changes, so it is parsed
+only when its mtime moves; the countdown to a reset is computed from what has
+already been parsed, on every list refresh.
+
+Claude Code refreshes that cache, not fleet. When nobody has touched it for
+more than twenty minutes, the heading says `1h ago` instead of pretending the
+numbers are current. When a reset time has passed, the whole row goes faint and
+the time column says `stale` — the percentage then describes a window that is
+over. With no cache at all (before the first login, say) the footer is not
+drawn.
+
+The percentage follows the usage: green up to 50%, yellow up to 85%, red above
+that. The bar itself is the accent colour — its length says what the colour
+would say, so it does not say it twice. By default it takes `theme.accent` and
+`theme.accent_dim` from the config, which means changing one colour moves the
+whole chrome along with the bar; `theme.bar` and `theme.bar_empty` give it
+colours of its own when that is what you want:
+
+```toml
+[theme]
+accent     = "#D97757"   # the bar and every other accent
+accent_dim = "#8A4C36"   # the empty part of the bar
+# bar       = "#6EA87A"  # the bar only, independent of the accent
+# bar_empty = "#2A3A2E"
+```
+
+## Scrolling
+
+The wheel has two possible recipients, and the child decides which one it is.
+
+Claude Code usually renders in the normal buffer: history leaves through the
+top of the screen and lands in the emulator's scrollback, so the wheel moves
+our own view (`set_scrollback`) and the pane border shows `^12`.
+
+But when Claude Code switches to the **alternate screen** (`ESC[?1049h`) and
+turns on its own mouse tracking (`ESC[?1000h`…`ESC[?1006h`), both halves of
+that mechanism disappear at once: the alternate `vt100` grid is created with
+zero scrollback, so there is nothing to scroll, and the history is inside the
+child anyway, not with us. The only thing that works then is passing the wheel
+on — the way a real terminal does, as an SGR report `ESC[<64;col;rowM`.
+
+So fleet looks at the emulator's `mouse_protocol_mode()`: a child that asked
+for the mouse gets a wheel notice on the PTY (coordinates relative to the
+inside of the pane, counting from 1); a child that did not ask stays with our
+scrollback. That notice goes through `write_passthrough` rather than the usual
+`write_input`, because the wheel is not a key press and has no business pulling
+the view back to the end.
+
+The wheel over the session list moves the selection, not the terminal.
+
+If nothing scrolls in any mode, the question is one level earlier: does the
+terminal fleet is running in hand wheel events to applications at all?
+`claude-fleet --mouse` answers that.
+
+## Two pitfalls this code answers
+
+**1. ConPTY blocks without an answer to DSR.** Right after startup, ConPTY
+sends `ESC[6n` (a cursor position request) and **waits** for the terminal's
+answer. An emulator that does not answer hangs every child at startup — the
+process looks dead and has produced exactly 4 bytes. The `dsr` module scans the
+child's output and sends back `ESC[<row>;<col>R`, `ESC[0n` and answers to
+Device Attributes. That is why the PTY writer is shared (`Arc<Mutex<…>>`): both
+the UI thread and the reading thread answer on it.
+
+**2. A named pipe's name contains a backslash.** The pipe namespace is flat and
+`\` is an ordinary character in it. `\\.\pipe\LOCAL\cc-msg-abc` appears as the
+single name `LOCAL\cc-msg-abc`, so trimming to the last path segment never
+matches. Only the `\\.\pipe\` prefix may be stripped.
+
+## Build environment
+
+On this machine the active toolchain is `x86_64-pc-windows-gnu`, and `PATH`
+holds a stale 32-bit `C:\MinGW\bin\dlltool.exe` that wins over the correct
+`dlltool` from WinLibs. The result:
+
+```
+dlltool could not create import library ... Invalid bfd target
+```
+
+This is not a bug in this project — it blows up on `windows-sys`. `build.cmd`
+puts the WinLibs mingw64 ahead of it in `PATH` for the duration of the build
+only and does not touch the global environment. Permanent fixes (pick one, both
+outside the scope of this repo): move `C:\MinGW` behind WinLibs in the system
+`PATH`, or switch to the `x86_64-pc-windows-msvc` toolchain after installing
+the VS Build Tools.
+
+## What is not here
+
+- **Sending messages to foreign sessions.** It would need the `cc-msg`
+  protocol, which is undocumented. For our own sessions it is unnecessary —
+  writing to the PTY's stdin does exactly the same thing.
+- **Resurrecting a session process.** The conversation comes back through
+  `claude --resume`, but the process is new — screen, scrollback and tool state
+  start from zero.
+- **A reliable transcript-to-process mapping.** Nothing records it: the
+  registry knows a pid, the transcript knows none. With several sessions in one
+  directory fleet pairs them by order (newest transcript to the most recently
+  started session) and may swap them around on a restart.
+- **git worktree integration.** Two sessions in one working tree mix up each
+  other's state; fleet does not police that.

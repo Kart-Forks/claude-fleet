@@ -1,0 +1,4 @@
+/target
+/claude-fleet.exe
+fleet-*.exe
+restore-*.txt

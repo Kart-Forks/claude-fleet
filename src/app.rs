@@ -1,0 +1,716 @@
+//! Application state and the actions the key handler can trigger.
+
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant, SystemTime},
+};
+
+use anyhow::Result;
+
+use crate::{
+    config, history,
+    registry::{self, RegistryEntry},
+    session::{label_for, PtySession},
+    supervise, usage,
+};
+
+/// How many past conversations the resume list offers. Enough to hold a few
+/// days of work; past that one knows the directory and opens it by name.
+const RESUME_LIMIT: usize = 20;
+
+const REGISTRY_REFRESH: Duration = Duration::from_millis(750);
+
+/// How often the binary this fleet was started from is checked for a rebuild.
+/// It is one `stat` and nobody rebuilds twice a second.
+const EXE_CHECK: Duration = Duration::from_millis(1000);
+
+/// How long a finished session's card stays on the list before the fleet drops
+/// it by itself, and how long the `u` chord stays armed after landing in a
+/// session. Both are config, read fresh so an edit takes effect at once:
+/// `config::finished_ttl()` and `config::understand_window()`.
+///
+/// The chord reads both ways round — `u` first and then the target, or the
+/// target first and `u` right after — because both are how one reaches for it.
+/// The window is what makes the second order possible without stealing the
+/// key from someone who simply started typing.
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Keys drive the fleet: move between sessions, spawn, kill.
+    Nav,
+    /// Keys go to the focused session's PTY. Only the reserved function keys
+    /// are intercepted, so nothing a chord would shadow reaches Claude wrong.
+    Focus,
+    /// The new-session dialog is open.
+    NewSession,
+    Help,
+    /// Confirming a kill of the selected session.
+    ConfirmKill,
+    /// `u` is armed and waiting to be told which session to understand.
+    Understand,
+    /// Confirming a restart into a new build, which costs the running sessions.
+    ConfirmRestart,
+    /// The typed path has no directory behind it; asking whether to create it.
+    ConfirmMkdir,
+    /// Picking a past conversation to carry on.
+    Resume,
+}
+
+/// The list of past conversations, and where in it the cursor is.
+pub struct ResumePicker {
+    pub items: Vec<history::Conversation>,
+    pub cursor: usize,
+}
+
+impl ResumePicker {
+    fn new() -> Self {
+        Self {
+            items: history::recent(RESUME_LIMIT),
+            cursor: 0,
+        }
+    }
+
+    pub fn move_cursor(&mut self, delta: isize) {
+        if self.items.is_empty() {
+            return;
+        }
+        let len = self.items.len() as isize;
+        self.cursor = (self.cursor as isize + delta).rem_euclid(len) as usize;
+    }
+
+    pub fn selected(&self) -> Option<&history::Conversation> {
+        self.items.get(self.cursor)
+    }
+}
+
+pub struct NewSessionForm {
+    pub input: String,
+    pub recent: Vec<PathBuf>,
+    /// `0` is the free-text field; `n` selects `recent[n - 1]`.
+    pub cursor: usize,
+}
+
+impl NewSessionForm {
+    fn new(default_cwd: &std::path::Path) -> Self {
+        Self {
+            input: default_cwd.display().to_string(),
+            recent: registry::recent_cwds(12),
+            cursor: 0,
+        }
+    }
+
+    pub fn selected_path(&self) -> PathBuf {
+        if self.cursor == 0 {
+            PathBuf::from(self.input.trim())
+        } else {
+            self.recent[self.cursor - 1].clone()
+        }
+    }
+
+    pub fn move_cursor(&mut self, delta: isize) {
+        let max = self.recent.len() as isize;
+        self.cursor = (self.cursor as isize + delta).clamp(0, max) as usize;
+    }
+}
+
+pub struct App {
+    pub sessions: Vec<PtySession>,
+    pub selected: usize,
+    pub mode: Mode,
+    pub form: Option<NewSessionForm>,
+    /// Path awaiting a yes/no on creating its directory.
+    pub pending_mkdir: Option<PathBuf>,
+    /// The resume list, while it is open.
+    pub resume: Option<ResumePicker>,
+    pub registry: Vec<RegistryEntry>,
+    pub status: Option<(String, Instant)>,
+    /// Shared with reader threads; set when any pane produced output.
+    pub dirty: Arc<AtomicBool>,
+    pub should_quit: bool,
+    pub launch_cwd: PathBuf,
+    last_registry_scan: Instant,
+    /// Pane geometry from the last render, used when spawning.
+    pub pane_rows: u16,
+    pub pane_cols: u16,
+    /// Top-left of the pane's inner area on screen, for turning a mouse
+    /// position into the pane-relative one a child expects.
+    pub pane_x: u16,
+    pub pane_y: u16,
+    /// A paste handed over in pieces: its opening marker is out, its closing
+    /// one is not. Until it is, every piece of input belongs to that paste.
+    pub paste_open: bool,
+    /// The session just landed in, and when. While this is fresh a lone `u`
+    /// is the understand chord instead of a character for the child.
+    understand_window: Option<(usize, Instant)>,
+    /// The next session spawned carries the understand prompt. It has to be a
+    /// flag rather than an argument because a spawn can cross the new-session
+    /// form and the "create the directory?" question before it happens.
+    spawn_understand: bool,
+    /// Quitting to be started again, rather than quitting.
+    pub restart_requested: bool,
+    /// A build has replaced the binary this fleet was started from.
+    pub update_ready: bool,
+    /// What that binary looked like at startup, to compare against.
+    origin_stamp: Option<SystemTime>,
+    last_exe_check: Instant,
+    /// The account's rate-limit windows, as Claude Code last cached them.
+    pub usage: usage::Watch,
+}
+
+impl App {
+    pub fn new(launch_cwd: PathBuf) -> Self {
+        Self {
+            sessions: Vec::new(),
+            selected: 0,
+            mode: Mode::Nav,
+            form: None,
+            pending_mkdir: None,
+            resume: None,
+            registry: registry::read_all(),
+            status: None,
+            dirty: Arc::new(AtomicBool::new(true)),
+            should_quit: false,
+            launch_cwd,
+            last_registry_scan: Instant::now(),
+            pane_rows: 24,
+            pane_cols: 80,
+            pane_x: 0,
+            pane_y: 0,
+            paste_open: false,
+            understand_window: None,
+            spawn_understand: false,
+            restart_requested: false,
+            update_ready: false,
+            usage: usage::Watch::new(),
+            origin_stamp: supervise::origin_stamp(),
+            last_exe_check: Instant::now(),
+        }
+    }
+
+    pub fn selected_session(&self) -> Option<&PtySession> {
+        self.sessions.get(self.selected)
+    }
+
+    pub fn selected_session_mut(&mut self) -> Option<&mut PtySession> {
+        self.sessions.get_mut(self.selected)
+    }
+
+    pub fn notify(&mut self, msg: impl Into<String>) {
+        self.status = Some((msg.into(), Instant::now()));
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Foreign sessions: everything in the registry we did not spawn.
+    pub fn foreign(&self) -> Vec<&RegistryEntry> {
+        let own: Vec<u32> = self.sessions.iter().filter_map(|s| s.child_pid).collect();
+        self.registry
+            .iter()
+            .filter(|e| !own.contains(&e.pid))
+            .collect()
+    }
+
+    /// The registry entry describing one of our own sessions, if it has
+    /// finished registering itself yet.
+    pub fn entry_for(&self, idx: usize) -> Option<&RegistryEntry> {
+        let pid = self.sessions.get(idx)?.child_pid?;
+        registry::find_by_pid(&self.registry, pid)
+    }
+
+    pub fn spawn_session(&mut self, cwd: PathBuf) -> Result<()> {
+        self.spawn_session_with(cwd, &[])
+    }
+
+    /// Spawn with arguments for the child. Today that is `--resume <id>` and
+    /// nothing else: a session picked up where it was left is an ordinary
+    /// session in every other respect, down to the understand prompt.
+    pub fn spawn_session_with(&mut self, cwd: PathBuf, args: &[String]) -> Result<()> {
+        if !cwd.is_dir() {
+            self.notify(format!("no such directory: {}", cwd.display()));
+            return Ok(());
+        }
+        let taken: Vec<String> = self.sessions.iter().map(|s| s.label.clone()).collect();
+        let label = label_for(&cwd, &taken);
+
+        let session = PtySession::spawn(
+            label.clone(),
+            cwd,
+            self.pane_rows.max(4),
+            self.pane_cols.max(20),
+            Arc::clone(&self.dirty),
+            args,
+        )?;
+
+        self.sessions.push(session);
+        self.selected = self.sessions.len() - 1;
+        self.mode = Mode::Focus;
+
+        if std::mem::take(&mut self.spawn_understand) {
+            // The child has no prompt box yet; the session holds the text and
+            // types it in once it has one.
+            let idx = self.selected;
+            let prompt = config::understand_prompt();
+            self.sessions[idx].queue_prompt(&prompt);
+            self.understand_window = None;
+            self.notify(format!("{label}: \"{prompt}\" will go into the prompt"));
+        } else {
+            self.open_understand_window(self.selected);
+            self.notify(format!("started {label}"));
+        }
+        Ok(())
+    }
+
+    /// Arm `u` and wait for the key that says which session it is for.
+    pub fn arm_understand(&mut self) {
+        self.mode = Mode::Understand;
+        self.notify("understand project: F1-F9 session, u new, enter selected, esc cancels");
+    }
+
+    /// The next spawn, wherever it comes from, carries the prompt.
+    pub fn arm_understand_spawn(&mut self) {
+        self.spawn_understand = true;
+    }
+
+    /// Quit in the way that brings the fleet back, running the new build.
+    ///
+    /// The directories in use are written out first: the sessions themselves
+    /// cannot survive — a child dies with the pseudoconsole its parent owns —
+    /// but where they were working is worth carrying over.
+    pub fn restart(&mut self) {
+        let list = self.restore_list();
+        supervise::write_restore(&list);
+        self.restart_requested = true;
+        self.should_quit = true;
+    }
+
+    /// The live sessions, each with the conversation it was holding.
+    ///
+    /// Nothing records which transcript belongs to which child — the registry
+    /// carries a pid and the transcript carries neither. What both ends do
+    /// have is an order: within one directory the transcript written to last
+    /// belongs to the session that was last busy, and the session started last
+    /// is the best guess at which one that is. With one session per directory,
+    /// which is the ordinary case, there is nothing to guess.
+    fn restore_list(&self) -> Vec<supervise::Restore> {
+        let alive: Vec<usize> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_alive())
+            .map(|(i, _)| i)
+            .collect();
+
+        let mut ids: Vec<Option<String>> = vec![None; self.sessions.len()];
+        let mut done: Vec<&std::path::Path> = Vec::new();
+        for &i in &alive {
+            let cwd = self.sessions[i].cwd.as_path();
+            if done.contains(&cwd) {
+                continue;
+            }
+            done.push(cwd);
+
+            let mut here: Vec<usize> = alive
+                .iter()
+                .copied()
+                .filter(|&j| self.sessions[j].cwd == cwd)
+                .collect();
+            here.sort_by_key(|&j| std::cmp::Reverse(self.sessions[j].started));
+            for (j, c) in here.iter().zip(history::latest_in(cwd, here.len())) {
+                ids[*j] = Some(c.id);
+            }
+        }
+
+        alive
+            .into_iter()
+            .map(|i| supervise::Restore::new(self.sessions[i].cwd.clone(), ids[i].clone()))
+            .collect()
+    }
+
+    /// Open the list of past conversations.
+    pub fn open_resume_picker(&mut self) {
+        let picker = ResumePicker::new();
+        if picker.items.is_empty() {
+            self.notify("no saved conversations in ~/.claude/projects");
+            return;
+        }
+        self.form = None;
+        self.pending_mkdir = None;
+        self.resume = Some(picker);
+        self.mode = Mode::Resume;
+    }
+
+    pub fn close_resume_picker(&mut self) {
+        self.resume = None;
+        self.mode = Mode::Nav;
+    }
+
+    /// Carry on the conversation under the cursor, in the directory it was
+    /// held in.
+    pub fn resume_selected(&mut self) -> Result<()> {
+        let Some(c) = self.resume.as_ref().and_then(|p| p.selected()).cloned() else {
+            self.close_resume_picker();
+            return Ok(());
+        };
+        self.close_resume_picker();
+
+        if self.sessions.len() >= 9 {
+            self.notify("every F1-F9 slot is taken");
+            return Ok(());
+        }
+        let before = self.sessions.len();
+        self.spawn_session_with(c.cwd.clone(), &["--resume".to_string(), c.id.clone()])?;
+        if self.sessions.len() > before {
+            self.notify(format!("resumed: {}", crate::ui::truncate(&c.summary, 48)));
+        }
+        Ok(())
+    }
+
+    /// Restart, asking first when there is something to lose.
+    pub fn request_restart(&mut self) {
+        if supervise::origin().is_none() {
+            // Started outside the supervisor, so there is nothing to come back
+            // as. Saying so beats a key that looks broken.
+            self.notify("restart unavailable — fleet was started without a supervisor");
+            return;
+        }
+        if self.sessions.iter().any(|s| s.is_alive()) {
+            self.mode = Mode::ConfirmRestart;
+            return;
+        }
+        self.restart();
+    }
+
+    /// Reopen what a previous run left behind, carrying on the conversations
+    /// it was holding wherever their transcripts could be found.
+    pub fn restore_sessions(&mut self, items: Vec<supervise::Restore>) -> Result<()> {
+        let mut resumed = 0;
+        for item in items {
+            match item.session {
+                Some(id) => {
+                    self.spawn_session_with(item.cwd, &["--resume".to_string(), id])?;
+                    resumed += 1;
+                }
+                None => self.spawn_session(item.cwd)?,
+            }
+        }
+        if !self.sessions.is_empty() {
+            // Coming back into a focused pane of a session that is still
+            // painting reads as a freeze; the list shows what came back.
+            self.mode = Mode::Nav;
+            self.selected = 0;
+            let n = self.sessions.len();
+            self.notify(if resumed == n {
+                format!("{n} sessions came back after the restart, with their conversations")
+            } else {
+                format!("{n} sessions came back after the restart, conversations resumed: {resumed}")
+            });
+        }
+        Ok(())
+    }
+
+    /// Drop an armed prompt that never got a session, so it cannot ride along
+    /// with an unrelated spawn later.
+    pub fn disarm_understand_spawn(&mut self) {
+        self.spawn_understand = false;
+    }
+
+    /// Start the window in which a lone `u` is still the chord.
+    pub fn open_understand_window(&mut self, idx: usize) {
+        self.understand_window = Some((idx, Instant::now()));
+    }
+
+    /// Read the window back, if it is still open and still points somewhere.
+    /// Consuming it either way keeps a stale window from firing much later.
+    pub fn take_understand_window(&mut self) -> Option<usize> {
+        let (idx, at) = self.understand_window.take()?;
+        (at.elapsed() <= config::understand_window() && idx < self.sessions.len())
+            .then_some(idx)
+    }
+
+    /// Put the prompt into a session that already exists.
+    pub fn understand(&mut self, idx: usize) {
+        self.understand_window = None;
+        let Some(s) = self.sessions.get_mut(idx) else {
+            self.notify("no such session");
+            return;
+        };
+        if !s.is_alive() {
+            let label = s.label.clone();
+            self.notify(format!("{label} has finished — nowhere to type"));
+            return;
+        }
+        let label = s.label.clone();
+        let prompt = config::understand_prompt();
+        s.queue_prompt(&prompt);
+        self.selected = idx;
+        self.mode = Mode::Focus;
+        self.notify(format!("{label}: \"{prompt}\" is in the prompt — enter sends it"));
+    }
+
+    /// Where a new session lands when nothing else says otherwise: next to the
+    /// session you are looking at, or the directory the fleet was started in.
+    pub fn default_cwd(&self) -> PathBuf {
+        self.selected_session()
+            .map(|s| s.cwd.clone())
+            .unwrap_or_else(|| self.launch_cwd.clone())
+    }
+
+    /// Spawn into `cwd`, but stop and ask first when the directory is missing.
+    /// Typing a path that does not exist yet is a normal thing to do; refusing
+    /// it outright means retyping it somewhere else.
+    pub fn request_spawn(&mut self, cwd: PathBuf) -> Result<()> {
+        if cwd.is_dir() {
+            self.form = None;
+            self.mode = Mode::Nav;
+            return self.spawn_session(cwd);
+        }
+        if cwd.exists() {
+            self.notify(format!("not a directory: {}", cwd.display()));
+            return Ok(());
+        }
+        if cwd.as_os_str().is_empty() {
+            self.notify("empty path");
+            return Ok(());
+        }
+        self.pending_mkdir = Some(cwd);
+        self.mode = Mode::ConfirmMkdir;
+        Ok(())
+    }
+
+    /// Answer to the "create it?" dialog. `yes` creates the directory and
+    /// spawns; anything else drops back into the form with the path intact.
+    pub fn resolve_mkdir(&mut self, yes: bool) -> Result<()> {
+        let Some(path) = self.pending_mkdir.take() else {
+            self.mode = Mode::Nav;
+            return Ok(());
+        };
+        if !yes {
+            // The form is still behind the dialog, so editing continues where
+            // it left off.
+            self.mode = if self.form.is_some() {
+                Mode::NewSession
+            } else {
+                Mode::Nav
+            };
+            return Ok(());
+        }
+        if let Err(e) = std::fs::create_dir_all(&path) {
+            self.mode = if self.form.is_some() {
+                Mode::NewSession
+            } else {
+                Mode::Nav
+            };
+            self.notify(format!("could not create the directory: {e}"));
+            return Ok(());
+        }
+        self.form = None;
+        self.mode = Mode::Nav;
+        // `spawn_session` reports the session it started; saying "utworzono"
+        // here would only be overwritten by it a moment later.
+        self.spawn_session(path)
+    }
+
+    pub fn open_new_session_form(&mut self) {
+        self.open_new_session_form_with(false);
+    }
+
+    /// The form, with the understand prompt armed or explicitly disarmed.
+    /// Opening it plainly has to clear the flag: an abandoned `u` from earlier
+    /// must not ride along with the next ordinary new session.
+    pub fn open_new_session_form_with(&mut self, understand: bool) {
+        self.spawn_understand = understand;
+        // A fresh form means the earlier "create it?" question is void.
+        self.pending_mkdir = None;
+        let default = self.default_cwd();
+        self.form = Some(NewSessionForm::new(&default));
+        self.mode = Mode::NewSession;
+    }
+
+    pub fn kill_selected(&mut self) {
+        if let Some(s) = self.sessions.get_mut(self.selected) {
+            let label = s.label.clone();
+            s.kill();
+            self.notify(format!("killed {label}"));
+        }
+    }
+
+    pub fn close_selected(&mut self) {
+        if self.selected < self.sessions.len() {
+            self.sessions.remove(self.selected);
+            self.selected = self.selected.saturating_sub(1);
+            if self.sessions.is_empty() {
+                self.mode = Mode::Nav;
+            }
+        }
+    }
+
+    /// Drop the cards of sessions that have been dead for longer than
+    /// the configured TTL, keeping the selection on the same session where it
+    /// can.
+    fn expire_finished(&mut self) {
+        let expired: Vec<usize> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.finished_for()
+                    .is_some_and(|d| d >= config::finished_ttl())
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+
+        // Removing back to front keeps the remaining indices valid.
+        for &i in expired.iter().rev() {
+            self.sessions.remove(i);
+            if i < self.selected {
+                self.selected -= 1;
+            }
+        }
+        self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
+        if self.sessions.is_empty() || !self.sessions[self.selected].is_alive() {
+            // Nothing left to type into, so never leave the user in a focused
+            // pane that no longer exists.
+            if self.mode == Mode::Focus {
+                self.mode = Mode::Nav;
+            }
+        }
+        let n = expired.len();
+        self.notify(if n == 1 {
+            "closed the finished session".to_string()
+        } else {
+            format!("closed finished sessions ({n})")
+        });
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    pub fn select(&mut self, delta: isize) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        let len = self.sessions.len() as isize;
+        let next = (self.selected as isize + delta).rem_euclid(len);
+        self.selected = next as usize;
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    pub fn select_index(&mut self, idx: usize) {
+        if idx < self.sessions.len() {
+            self.selected = idx;
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Per-frame bookkeeping: reap dead children, drop expired cards, refresh
+    /// the registry, expire the status line.
+    pub fn tick(&mut self) {
+        // Reaps children and records exit codes; the return value is read via
+        // `is_alive` during render.
+        for s in &mut self.sessions {
+            s.poll_alive();
+            // Text queued before the child painted its input box goes in as
+            // soon as it has one.
+            s.flush_prompt();
+        }
+        // A draining paste changes the pane's badge every frame, and the child's
+        // own output may be quiet meanwhile, so ask for the redraw here.
+        if self
+            .sessions
+            .iter()
+            .any(|s| s.queued_input() > 0 || s.prompt_pending())
+        {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+        self.expire_finished();
+
+        // The config is read back whenever the file moves, so an edit shows up
+        // in the next frame without anything being restarted.
+        match config::reload_if_changed() {
+            Some(config::Reload::Applied) => self.notify("config reloaded"),
+            Some(config::Reload::Failed(e)) => self.notify(format!("config rejected: {e}")),
+            None => {}
+        }
+
+        if !self.update_ready && self.last_exe_check.elapsed() >= EXE_CHECK {
+            self.last_exe_check = Instant::now();
+            let now = supervise::origin_stamp();
+            if now.is_some() && now != self.origin_stamp {
+                self.update_ready = true;
+                self.notify("new build ready — r restarts the fleet");
+            }
+        }
+
+        if self.last_registry_scan.elapsed() >= REGISTRY_REFRESH {
+            self.registry = registry::read_all();
+            self.last_registry_scan = Instant::now();
+            self.dirty.store(true, Ordering::Relaxed);
+            // Same cadence as the registry: the limits move slowly, and their
+            // countdowns only need to be right to the minute on screen.
+            if self.usage.refresh() {
+                self.dirty.store(true, Ordering::Relaxed);
+            }
+        }
+
+        if let Some((_, at)) = &self.status
+            && at.elapsed() > Duration::from_secs(4) {
+                self.status = None;
+                self.dirty.store(true, Ordering::Relaxed);
+            }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new(PathBuf::from("."))
+    }
+
+    #[test]
+    fn the_understand_window_needs_a_session_behind_it() {
+        let mut app = app();
+        app.open_understand_window(0);
+        // The window points at a session that is not there, so a `u` arriving
+        // now is an ordinary letter.
+        assert!(app.take_understand_window().is_none());
+    }
+
+    #[test]
+    fn a_stale_window_no_longer_answers() {
+        let mut app = app();
+        app.understand_window = Some((0, Instant::now() - config::understand_window() * 2));
+        assert!(app.take_understand_window().is_none());
+    }
+
+    #[test]
+    fn the_window_answers_once() {
+        let mut app = app();
+        app.open_understand_window(0);
+        // Consumed either way: a window left open would fire much later, on a
+        // `u` that meant nothing of the sort.
+        let _ = app.take_understand_window();
+        assert!(app.understand_window.is_none());
+    }
+
+    #[test]
+    fn an_abandoned_form_drops_its_armed_prompt() {
+        let mut app = app();
+        app.arm_understand_spawn();
+        app.disarm_understand_spawn();
+        assert!(!app.spawn_understand);
+    }
+
+    #[test]
+    fn an_ordinary_new_session_form_clears_an_older_arming() {
+        let mut app = app();
+        app.arm_understand_spawn();
+        app.open_new_session_form();
+        assert!(!app.spawn_understand);
+    }
+}
