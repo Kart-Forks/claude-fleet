@@ -2,6 +2,13 @@
 name = "claude-fleet"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "A terminal multiplexer for Claude Code sessions on Windows"
+license = "MIT"
+repository = "https://github.com/Sowiastyy/claude-fleet"
+readme = "README.md"
+keywords = ["claude", "tui", "terminal", "multiplexer", "conpty"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.104"

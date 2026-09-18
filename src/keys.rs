@@ -150,6 +150,47 @@ pub fn encode_paste_chunk(text: &str, bracketed: bool, open: bool, close: bool) 
 pub const PASTE_START: &[u8] = b"[200~";
 pub const PASTE_END: &[u8] = b"[201~";
 
+/// Encode a mouse wheel notch for a child that asked for mouse reporting.
+///
+/// Claude Code runs on the alternate screen (`ESC[?1049h`) and turns on its own
+/// tracking (`ESC[?1000h` … `ESC[?1006h`): its history lives inside the child,
+/// not in the emulator's scrollback, which the alternate grid does not even
+/// keep. So a wheel notch has to be handed to the child the way a real terminal
+/// hands it over, or nothing scrolls at all.
+///
+/// `col` and `row` are 1-based and pane-relative.
+pub fn encode_wheel(
+    up: bool,
+    col: u16,
+    row: u16,
+    encoding: vt100::MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
+    // Wheel buttons are the low two bits with bit 6 (64) set.
+    let button: u16 = if up { 64 } else { 65 };
+    match encoding {
+        vt100::MouseProtocolEncoding::Sgr => {
+            Some(format!("\x1b[<{button};{col};{row}M").into_bytes())
+        }
+        vt100::MouseProtocolEncoding::Utf8 => {
+            let mut out = b"\x1b[M".to_vec();
+            for v in [button + 32, col + 32, row + 32] {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(char::from_u32(u32::from(v))?.encode_utf8(&mut buf).as_bytes());
+            }
+            Some(out)
+        }
+        vt100::MouseProtocolEncoding::Default => {
+            // The classic encoding is one byte per field, so it simply cannot
+            // address anything past column 223.
+            let (b, c, r) = (button + 32, col + 32, row + 32);
+            if b > 255 || c > 255 || r > 255 {
+                return None;
+            }
+            Some(vec![0x1b, b'[', b'M', b as u8, c as u8, r as u8])
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,46 +259,5 @@ mod tests {
     fn alt_char_is_escape_prefixed() {
         let out = encode(key(KeyCode::Char('b'), KeyModifiers::ALT), false).unwrap();
         assert_eq!(out, vec![0x1b, b'b']);
-    }
-}
-
-/// Encode a mouse wheel notch for a child that asked for mouse reporting.
-///
-/// Claude Code runs on the alternate screen (`ESC[?1049h`) and turns on its own
-/// tracking (`ESC[?1000h` … `ESC[?1006h`): its history lives inside the child,
-/// not in the emulator's scrollback, which the alternate grid does not even
-/// keep. So a wheel notch has to be handed to the child the way a real terminal
-/// hands it over, or nothing scrolls at all.
-///
-/// `col` and `row` are 1-based and pane-relative.
-pub fn encode_wheel(
-    up: bool,
-    col: u16,
-    row: u16,
-    encoding: vt100::MouseProtocolEncoding,
-) -> Option<Vec<u8>> {
-    // Wheel buttons are the low two bits with bit 6 (64) set.
-    let button: u16 = if up { 64 } else { 65 };
-    match encoding {
-        vt100::MouseProtocolEncoding::Sgr => {
-            Some(format!("\x1b[<{button};{col};{row}M").into_bytes())
-        }
-        vt100::MouseProtocolEncoding::Utf8 => {
-            let mut out = b"\x1b[M".to_vec();
-            for v in [button + 32, col + 32, row + 32] {
-                let mut buf = [0u8; 4];
-                out.extend_from_slice(char::from_u32(u32::from(v))?.encode_utf8(&mut buf).as_bytes());
-            }
-            Some(out)
-        }
-        vt100::MouseProtocolEncoding::Default => {
-            // The classic encoding is one byte per field, so it simply cannot
-            // address anything past column 223.
-            let (b, c, r) = (button + 32, col + 32, row + 32);
-            if b > 255 || c > 255 || r > 255 {
-                return None;
-            }
-            Some(vec![0x1b, b'[', b'M', b as u8, c as u8, r as u8])
-        }
     }
 }

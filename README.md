@@ -5,17 +5,46 @@ list, the right one is the full, interactive terminal of the selected session.
 
 ```
 ┌─ SESSIONS ────┬─ api-a6 ────────────────────────────┐
-│ * piotr-c3    │ > fix the test in auth.spec.ts      │
+│ * web-c3      │ > fix the test in auth.spec.ts      │
 │   .           │                                     │
 │ o api-a6  ◀   │ ⏺ Read(src/auth.spec.ts)            │
 │   apps/api    │   ⎿ Read 120 lines                  │
 │               │                                     │
 │ --- UNREACHABLE                                     │
-│ ! smartwood…  │ ✻ Thinking… (7s · ↑ 1.2k tokens)    │
+│ ! dashboard…  │ ✻ Thinking… (7s · ↑ 1.2k tokens)    │
 ├───────────────┴─────────────────────────────────────┤
 │ [F10] LEAVE FOCUS   F1-F9 session   F11 new         │
 └─────────────────────────────────────────────────────┘
 ```
+
+> **Unofficial.** claude-fleet is a community project and is not affiliated
+> with, endorsed by, or supported by Anthropic. "Claude" and "Claude Code" are
+> trademarks of Anthropic.
+>
+> Fleet reads Claude Code's **undocumented** local state (`~/.claude/sessions`,
+> `~/.claude.json`, the `cc-msg` named pipes). Any Claude Code update can
+> change those and break parts of fleet without notice.
+
+## Requirements
+
+- **Windows 10 1809 or newer** (ConPTY). Windows only — fleet is built on
+  ConPTY and named pipes; it compiles elsewhere but session liveness and the
+  restart supervisor assume Windows.
+- [Claude Code](https://docs.claude.com/en/docs/claude-code) installed, with
+  `claude` on `PATH` (or in `~/.local/bin`).
+- To build from source: Rust 1.85 or newer (edition 2024).
+
+## Install
+
+Download `claude-fleet.exe` from the
+[latest release](https://github.com/Sowiastyy/claude-fleet/releases/latest),
+or build it yourself:
+
+```
+cargo install --git https://github.com/Sowiastyy/claude-fleet
+```
+
+Then run `claude-fleet` in any directory.
 
 ## How it works
 
@@ -192,8 +221,8 @@ most recent conversations, newest first:
 ╭ resume a conversation ──────────────────────────────────────────────╮
 │ enter resumes, esc closes                                           │
 │ > claude-fleet    make the limit progress bar bigger, add resume   2m│
-│   smartwood-api   add a date filter to the orders view             5h│
-│   KonduktorPDF    Batch Print Manager — Build Spec                 2d│
+│   billing-api     add a date filter to the orders view             5h│
+│   pdf-tools       Batch print manager — build spec                 2d│
 ╰─────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -269,7 +298,7 @@ With that layout fleet finds the build output by itself — it takes the newer o
 it by hand. When the two are the same file, fleet says so at startup, because
 no copying further down will help then.
 
-The working loop therefore looks like this: `build.cmd build --release`, fleet
+The working loop therefore looks like this: `cargo build --release`, fleet
 notices the new file within a second and prints `new build ready`, `r` moves
 into the new version. Nothing has to be copied by hand.
 
@@ -300,10 +329,15 @@ probe shows exactly the four bytes you are asking about (see pitfall 1).
 ## Building
 
 ```
-build.cmd build --release
+cargo build --release
+cargo test
 ```
 
-`build.cmd` is a thin wrapper around `cargo` — see below for why it is needed.
+The binary lands in `target/release/claude-fleet.exe`. For the restart loop
+described under "Live changes", copy it once next to `target` and run that
+copy.
+
+On the `x86_64-pc-windows-gnu` toolchain, see "Build environment" below.
 
 ## Account limits
 
@@ -442,20 +476,28 @@ matches. Only the `\\.\pipe\` prefix may be stripped.
 
 ## Build environment
 
-On this machine the active toolchain is `x86_64-pc-windows-gnu`, and `PATH`
-holds a stale 32-bit `C:\MinGW\bin\dlltool.exe` that wins over the correct
-`dlltool` from WinLibs. The result:
+The `x86_64-pc-windows-msvc` toolchain (with the VS Build Tools) needs nothing
+special.
+
+On `x86_64-pc-windows-gnu`, an old 32-bit `dlltool` earlier in `PATH` (a
+leftover `C:\MinGW\bin`, typically) wins over the 64-bit one and the build
+fails inside `windows-sys`:
 
 ```
 dlltool could not create import library ... Invalid bfd target
 ```
 
-This is not a bug in this project — it blows up on `windows-sys`. `build.cmd`
-puts the WinLibs mingw64 ahead of it in `PATH` for the duration of the build
-only and does not touch the global environment. Permanent fixes (pick one, both
-outside the scope of this repo): move `C:\MinGW` behind WinLibs in the system
-`PATH`, or switch to the `x86_64-pc-windows-msvc` toolchain after installing
-the VS Build Tools.
+`build.cmd` is a thin wrapper around `cargo` that puts a 64-bit mingw toolchain
+ahead of it in `PATH` for the duration of the build only. It defaults to the
+WinLibs package installed by winget; set `MINGW64` to point it elsewhere:
+
+```
+set MINGW64=C:\path\to\mingw64\bin
+build.cmd build --release
+```
+
+Permanent fixes: move the old MinGW behind the 64-bit one in the system `PATH`,
+or switch to the msvc toolchain.
 
 ## What is not here
 
@@ -471,3 +513,7 @@ the VS Build Tools.
   started session) and may swap them around on a restart.
 - **git worktree integration.** Two sessions in one working tree mix up each
   other's state; fleet does not police that.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
