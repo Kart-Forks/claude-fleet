@@ -580,7 +580,6 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             ("F1-F9", "session"),
             ("F11", "new"),
             ("F12", "help"),
-            ("every other key goes to Claude", ""),
         ],
         Mode::NewSession => vec![("enter", "start"), ("up/dn", "recent"), ("esc", "cancel")],
         Mode::Help => vec![("any key", "close")],

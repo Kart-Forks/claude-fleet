@@ -269,7 +269,9 @@ Surviving processes would mean moving the PTY into a separate host process;
 that is not here.
 
 What does come back is the **conversation**. Before exiting, fleet appends the
-transcript id of every live session to a restore file, and on return starts
+transcript id of every live session to a restore file — the `sessionId` the
+registry records next to that session's pid, so several sessions in one
+directory each get their own conversation back — and on return starts
 them with `claude --resume <id>` — same directory, same history, new process.
 The status bar shows `3 sessions came back after the restart, with their
 conversations`. When a transcript cannot be pinned down, that session comes
@@ -507,10 +509,6 @@ or switch to the msvc toolchain.
 - **Resurrecting a session process.** The conversation comes back through
   `claude --resume`, but the process is new — screen, scrollback and tool state
   start from zero.
-- **A reliable transcript-to-process mapping.** Nothing records it: the
-  registry knows a pid, the transcript knows none. With several sessions in one
-  directory fleet pairs them by order (newest transcript to the most recently
-  started session) and may swap them around on a restart.
 - **git worktree integration.** Two sessions in one working tree mix up each
   other's state; fleet does not police that.
 

@@ -89,6 +89,23 @@ pub fn recent(limit: usize) -> Vec<Conversation> {
     read_upto(files, limit)
 }
 
+/// Whether a transcript with this id exists in any project.
+///
+/// A session that never got a message has an id in the registry but nothing
+/// on disk, and `claude --resume` refuses an id it cannot find.
+pub fn exists(id: &str) -> bool {
+    let Some(root) = projects_dir() else {
+        return false;
+    };
+    let Ok(projects) = fs::read_dir(&root) else {
+        return false;
+    };
+    let name = format!("{id}.jsonl");
+    projects
+        .flatten()
+        .any(|p| p.path().join(&name).is_file())
+}
+
 /// The conversations held in one directory, newest first.
 ///
 /// This is the restart path: a session that is about to be killed is the one

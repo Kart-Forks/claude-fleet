@@ -388,13 +388,17 @@ impl App {
 
     /// The live sessions, each with the conversation it was holding.
     ///
-    /// Nothing records which transcript belongs to which child — the registry
-    /// carries a pid and the transcript carries neither. What both ends do
-    /// have is an order: within one directory the transcript written to last
-    /// belongs to the session that was last busy, and the session started last
-    /// is the best guess at which one that is. With one session per directory,
-    /// which is the ordinary case, there is nothing to guess.
+    /// The registry says it exactly: every process writes the `sessionId` it
+    /// is holding next to its pid, and the pid is ours. That id is taken
+    /// whenever a transcript with it exists — a session that never got a
+    /// message has an id but nothing to resume.
+    ///
+    /// Only a session that has not registered yet falls back to a guess by
+    /// order: within one directory the transcript written to last belongs to
+    /// the session started last. Ids already claimed by the registry are left
+    /// out of that guess, so it never hands one conversation to two sessions.
     fn restore_list(&self) -> Vec<supervise::Restore> {
+        let registry = registry::read_all();
         let alive: Vec<usize> = self
             .sessions
             .iter()
@@ -404,21 +408,40 @@ impl App {
             .collect();
 
         let mut ids: Vec<Option<String>> = vec![None; self.sessions.len()];
-        let mut done: Vec<&std::path::Path> = Vec::new();
+        let mut unregistered: Vec<usize> = Vec::new();
         for &i in &alive {
+            let known = self.sessions[i]
+                .child_pid
+                .and_then(|pid| registry::find_by_pid(&registry, pid))
+                .map(|e| e.session_id.clone())
+                .filter(|id| !id.is_empty());
+            match known {
+                Some(id) if history::exists(&id) => ids[i] = Some(id),
+                // Registered, but nothing said yet: a fresh start is right.
+                Some(_) => {}
+                None => unregistered.push(i),
+            }
+        }
+
+        let claimed: Vec<String> = ids.iter().flatten().cloned().collect();
+        let mut done: Vec<&std::path::Path> = Vec::new();
+        for &i in &unregistered {
             let cwd = self.sessions[i].cwd.as_path();
             if done.contains(&cwd) {
                 continue;
             }
             done.push(cwd);
 
-            let mut here: Vec<usize> = alive
+            let mut here: Vec<usize> = unregistered
                 .iter()
                 .copied()
                 .filter(|&j| self.sessions[j].cwd == cwd)
                 .collect();
             here.sort_by_key(|&j| std::cmp::Reverse(self.sessions[j].started));
-            for (j, c) in here.iter().zip(history::latest_in(cwd, here.len())) {
+            let guesses = history::latest_in(cwd, here.len() + claimed.len())
+                .into_iter()
+                .filter(|c| !claimed.contains(&c.id));
+            for (j, c) in here.iter().zip(guesses) {
                 ids[*j] = Some(c.id);
             }
         }
@@ -876,6 +899,7 @@ mod tests {
             status: "idle".into(),
             waiting_for: String::new(),
             started_at: 0,
+            session_id: String::new(),
         }];
         assert_eq!(app.foreign().len(), 1);
 

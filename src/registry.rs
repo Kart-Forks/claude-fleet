@@ -26,6 +26,9 @@ pub struct RegistryEntry {
     /// `dialog open`, `input needed`, `permission prompt`.
     pub waiting_for: String,
     pub started_at: u64,
+    /// The conversation the process is holding — the transcript's file name,
+    /// and what `claude --resume` takes. Empty until the process has one.
+    pub session_id: String,
 }
 
 impl RegistryEntry {
@@ -116,6 +119,7 @@ pub fn read_all() -> Vec<RegistryEntry> {
                 status: v["status"].as_str().unwrap_or("unknown").to_owned(),
                 waiting_for: v["waitingFor"].as_str().unwrap_or_default().to_owned(),
                 started_at: v["startedAt"].as_u64().unwrap_or(0),
+                session_id: v["sessionId"].as_str().unwrap_or_default().to_owned(),
             })
         })
         .filter(|e| e.pid != 0)
