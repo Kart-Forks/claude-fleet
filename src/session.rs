@@ -341,6 +341,15 @@ impl PtySession {
             .unwrap_or(false)
     }
 
+    /// Whether the cursor sits at the very start of the input box, where a
+    /// left arrow has nowhere further to go.
+    pub fn cursor_at_prompt_start(&self) -> bool {
+        self.parser
+            .read()
+            .map(|p| cursor_at_prompt_start(p.screen()))
+            .unwrap_or(false)
+    }
+
     pub fn cwd_label(&self) -> String {
         self.cwd
             .file_name()
@@ -444,4 +453,93 @@ pub fn label_for(cwd: &Path, taken: &[String]) -> String {
         .map(|n| format!("{base}-{n}"))
         .find(|c| !taken.contains(c))
         .expect("an unbounded range always finds a free name")
+}
+
+/// Where Claude Code's cursor is, if the screen shows one on a prompt row.
+///
+/// Claude Code may either park the terminal's own cursor in the input or hide
+/// it and paint the cursor as an inverse-video cell, so both are looked for.
+/// Only rows carrying the prompt caret are searched for the painted one: a
+/// cursor anywhere else is not at the start of the input anyway.
+fn prompt_cursor(screen: &vt100::Screen) -> Option<(u16, u16)> {
+    if !screen.hide_cursor() {
+        return Some(screen.cursor_position());
+    }
+    let (rows, cols) = screen.size();
+    (0..rows).find_map(|row| {
+        let caret = (0..cols).find(|&c| {
+            screen
+                .cell(row, c)
+                .is_some_and(|cell| cell.contents() == PROMPT_CARET.to_string())
+        })?;
+        (caret + 1..cols)
+            .find(|&c| screen.cell(row, c).is_some_and(|cell| cell.inverse()))
+            .map(|c| (row, c))
+    })
+}
+
+/// True when everything left of the cursor on its row is the prompt caret
+/// and the blanks or box border around it — the first position of the input.
+///
+/// A continuation row of a multi-line prompt has no caret in front of it, and
+/// a left arrow there wraps to the line above, so it does not count.
+fn cursor_at_prompt_start(screen: &vt100::Screen) -> bool {
+    // A scrolled-back view does not show the rows the cursor refers to.
+    if screen.scrollback() > 0 {
+        return false;
+    }
+    let Some((row, col)) = prompt_cursor(screen) else {
+        return false;
+    };
+    let before: String = (0..col)
+        .filter_map(|c| screen.cell(row, c))
+        .map(|cell| cell.contents())
+        .collect();
+    let rest = before.trim_matches(|ch: char| ch.is_whitespace() || ch == '│');
+    rest == PROMPT_CARET.to_string() || rest == ">"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn screen(bytes: &str) -> vt100::Parser {
+        let mut p = vt100::Parser::new(10, 40, 0);
+        p.process(bytes.as_bytes());
+        p
+    }
+
+    #[test]
+    fn empty_prompt_is_at_the_start() {
+        let p = screen("\x1b[5;1H❯ ");
+        assert!(cursor_at_prompt_start(p.screen()));
+    }
+
+    #[test]
+    fn text_before_the_cursor_is_not_the_start() {
+        let p = screen("\x1b[5;1H❯ hello");
+        assert!(!cursor_at_prompt_start(p.screen()));
+        let p = screen("\x1b[5;1H❯ hello\x1b[5;3H");
+        assert!(cursor_at_prompt_start(p.screen()));
+    }
+
+    #[test]
+    fn old_boxed_prompt_counts() {
+        let p = screen("\x1b[5;1H│ > ");
+        assert!(cursor_at_prompt_start(p.screen()));
+    }
+
+    #[test]
+    fn continuation_row_is_not_the_start() {
+        let p = screen("\x1b[5;1H❯ first\r\n  ");
+        assert!(!cursor_at_prompt_start(p.screen()));
+    }
+
+    #[test]
+    fn painted_cursor_is_found_when_the_real_one_is_hidden() {
+        let p = screen("\x1b[?25l\x1b[5;1H❯ \x1b[7mh\x1b[27mello\x1b[9;1H");
+        assert!(cursor_at_prompt_start(p.screen()));
+        let p = screen("\x1b[?25l\x1b[5;1H❯ he\x1b[7ml\x1b[27mlo\x1b[9;1H");
+        assert!(!cursor_at_prompt_start(p.screen()));
+    }
 }

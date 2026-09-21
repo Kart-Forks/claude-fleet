@@ -121,6 +121,7 @@ sooner.
 | key | action |
 |---|---|
 | **`F10`** | **leave focus** |
+| `←` at the start of the input | leave focus too — the arrow has nowhere left to go in the box |
 | everything else | goes to Claude, including `Ctrl+anything` |
 | mouse wheel | scroll the history (see "Scrolling") |
 

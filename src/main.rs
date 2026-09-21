@@ -1148,6 +1148,17 @@ fn handle_focus(app: &mut App, key: KeyEvent) -> Result<()> {
         return Ok(());
     }
 
+    // A left arrow with nowhere left to go in the input steps out to the
+    // session list, which sits to the left — the same as F10.
+    if key.code == KeyCode::Left
+        && key.modifiers.is_empty()
+        && session.cursor_at_prompt_start()
+    {
+        app.mode = Mode::Nav;
+        app.notify("left focus — enter goes back in");
+        return Ok(());
+    }
+
     let app_cursor = session.application_cursor();
     if let Some(bytes) = keys::encode(key, app_cursor) {
         session.write_input(&bytes)?;
