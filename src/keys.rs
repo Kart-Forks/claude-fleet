@@ -2,6 +2,30 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+/// Strip the modifiers Windows attaches to a character typed with AltGr.
+///
+/// On layouts like Polish programmer's, `ą` is AltGr+a, and the console reports
+/// AltGr as right-Alt plus left-Ctrl held together. Pasting is no different:
+/// conhost re-types the clipboard as key records, and every letter that needs
+/// AltGr on the active layout arrives with the same two modifiers. Taken at face
+/// value that is a Ctrl+Alt chord, which the encoder turns into `ESC ą`, the
+/// paste coalescer refuses to treat as text, and the path form drops outright.
+/// The character already reflects the layout, so the modifiers carry nothing.
+///
+/// Only non-ASCII characters qualify. A real Ctrl+Alt+letter chord reports the
+/// plain letter (crossterm looks it up from the layout when the console gives
+/// no character), and that has to stay a chord.
+pub fn normalize(key: KeyEvent) -> KeyEvent {
+    let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+    match key.code {
+        KeyCode::Char(c) if key.modifiers.contains(altgr) && !c.is_ascii() => KeyEvent {
+            modifiers: key.modifiers.difference(altgr),
+            ..key
+        },
+        _ => key,
+    }
+}
+
 /// Encode a key press for the child terminal.
 ///
 /// `app_cursor` reflects DECCKM: in application-cursor mode the arrow and Home/
@@ -27,6 +51,9 @@ pub fn encode(key: KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
                     ']' => 0x1d,
                     '^' => 0x1e,
                     '_' | '?' => 0x1f,
+                    // Anything else — a digit, punctuation, a non-ASCII
+                    // letter — has no control code, so it goes through as
+                    // itself.
                     _ => {
                         out.extend_from_slice(c.to_string().as_bytes());
                         return Some(out);
@@ -197,6 +224,32 @@ mod tests {
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn altgr_letter_loses_its_modifiers() {
+        let k = normalize(key(KeyCode::Char('ą'), KeyModifiers::CONTROL | KeyModifiers::ALT));
+        assert_eq!(k.code, KeyCode::Char('ą'));
+        assert!(k.modifiers.is_empty());
+    }
+
+    #[test]
+    fn altgr_with_shift_keeps_only_the_shift() {
+        let mods = KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT;
+        let k = normalize(key(KeyCode::Char('Ą'), mods));
+        assert_eq!(k.modifiers, KeyModifiers::SHIFT);
+    }
+
+    #[test]
+    fn a_real_ctrl_alt_chord_is_left_alone() {
+        let k = normalize(key(KeyCode::Char('a'), KeyModifiers::CONTROL | KeyModifiers::ALT));
+        assert_eq!(k.modifiers, KeyModifiers::CONTROL | KeyModifiers::ALT);
+    }
+
+    #[test]
+    fn a_polish_letter_encodes_as_its_utf8() {
+        let k = normalize(key(KeyCode::Char('ł'), KeyModifiers::CONTROL | KeyModifiers::ALT));
+        assert_eq!(encode(k, false).unwrap(), "ł".as_bytes());
     }
 
     #[test]

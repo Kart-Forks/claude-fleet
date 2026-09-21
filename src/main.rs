@@ -791,6 +791,7 @@ fn dispatch(app: &mut App, input: &Input, ev: Event) -> Result<()> {
     while let Some(ev) = next.take() {
         match ev {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
+                let key = keys::normalize(key);
                 if let Some(text) = typed_text(key)
                     && app.mode == Mode::Focus
                 {
@@ -876,7 +877,7 @@ fn drain_key_burst(input: &Input, first: char) -> Burst {
             break;
         };
         match ev {
-            Event::Key(key) if key.kind != KeyEventKind::Release => match typed_text(key) {
+            Event::Key(key) if key.kind != KeyEventKind::Release => match typed_text(keys::normalize(key)) {
                 Some(c) => text.push(c),
                 None => {
                     carry = Some(Event::Key(key));
