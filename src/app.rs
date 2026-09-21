@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc,
+        mpsc, Arc,
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -15,7 +15,7 @@ use crate::{
     config, history,
     registry::{self, RegistryEntry},
     session::{label_for, PtySession},
-    supervise, usage,
+    supervise, update, usage,
 };
 
 /// How many past conversations the resume list offers. Enough to hold a few
@@ -27,6 +27,10 @@ const REGISTRY_REFRESH: Duration = Duration::from_millis(750);
 /// How often the binary this fleet was started from is checked for a rebuild.
 /// It is one `stat` and nobody rebuilds twice a second.
 const EXE_CHECK: Duration = Duration::from_millis(1000);
+
+/// How often GitHub is asked about a newer release. Releases come days apart,
+/// and an unauthenticated client gets sixty API calls an hour.
+const UPDATE_CHECK: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// The shortest gap between two refreshes of the limit cache, used while our own
 /// sessions are burning through it.
@@ -168,6 +172,15 @@ pub struct App {
     pub restart_requested: bool,
     /// A build has replaced the binary this fleet was started from.
     pub update_ready: bool,
+    /// A release on GitHub newer than this binary, once a check has found one.
+    pub release: Option<update::Release>,
+    /// Set while a check or a download is running, so only one runs at a time.
+    update_busy: Arc<AtomicBool>,
+    /// What the update thread has to say, read back in `tick`.
+    update_tx: mpsc::Sender<UpdateEvent>,
+    update_rx: mpsc::Receiver<UpdateEvent>,
+    /// When GitHub was last asked; `None` makes the first tick ask.
+    last_update_check: Option<Instant>,
     /// What that binary looked like at startup, to compare against.
     origin_stamp: Option<SystemTime>,
     last_exe_check: Instant,
@@ -187,8 +200,19 @@ pub struct App {
     spent_since_refresh: bool,
 }
 
+/// What the update thread reports back.
+enum UpdateEvent {
+    Found(update::Release),
+    Installed(String),
+    Failed(String),
+}
+
 impl App {
     pub fn new(launch_cwd: PathBuf) -> Self {
+        if let Some(origin) = supervise::origin() {
+            update::sweep(&origin);
+        }
+        let (update_tx, update_rx) = mpsc::channel();
         Self {
             sessions: Vec::new(),
             selected: 0,
@@ -211,6 +235,11 @@ impl App {
             spawn_understand: false,
             restart_requested: false,
             update_ready: false,
+            release: None,
+            update_busy: Arc::new(AtomicBool::new(false)),
+            update_tx,
+            update_rx,
+            last_update_check: None,
             usage: usage::Watch::new(),
             usage_refresh: Arc::new(AtomicU32::new(0)),
             usage_refreshing: Arc::new(AtomicBool::new(false)),
@@ -506,6 +535,107 @@ impl App {
         self.restart();
     }
 
+    /// The file an update would replace, or why there is none.
+    fn update_target(&self) -> Result<PathBuf, &'static str> {
+        let origin = supervise::origin().ok_or("updates need the supervisor — start fleet normally")?;
+        if update::is_dev_build(&origin) {
+            return Err("fleet runs out of a cargo build — git pull and build instead");
+        }
+        Ok(origin)
+    }
+
+    /// Ask GitHub about a newer release, on a thread of its own.
+    fn check_for_update(&mut self) {
+        self.last_update_check = Some(Instant::now());
+        if self.update_target().is_err() || self.update_busy.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let busy = Arc::clone(&self.update_busy);
+        let tx = self.update_tx.clone();
+        let dirty = Arc::clone(&self.dirty);
+        std::thread::spawn(move || {
+            // No network is an ordinary state for a laptop, and nothing worth
+            // a status line: the next check is a few hours away regardless.
+            if let Ok(Some(rel)) = update::check() {
+                let _ = tx.send(UpdateEvent::Found(rel));
+            }
+            busy.store(false, Ordering::Relaxed);
+            dirty.store(true, Ordering::Relaxed);
+        });
+    }
+
+    /// Download the release found earlier and put it in place of the binary
+    /// the supervisor starts. The restart that picks it up is asked for once
+    /// the file is there.
+    pub fn install_update(&mut self) {
+        let Some(rel) = self.release.clone() else {
+            self.notify(format!("no newer release — this is v{}", update::CURRENT));
+            return;
+        };
+        let origin = match self.update_target() {
+            Ok(o) => o,
+            Err(why) => {
+                self.notify(why);
+                return;
+            }
+        };
+        if self.update_busy.swap(true, Ordering::Relaxed) {
+            self.notify("already talking to GitHub — a moment");
+            return;
+        }
+        self.notify(format!("downloading {}…", rel.tag));
+        let busy = Arc::clone(&self.update_busy);
+        let tx = self.update_tx.clone();
+        let dirty = Arc::clone(&self.dirty);
+        std::thread::spawn(move || {
+            let ev = match update::install(&rel, &origin) {
+                Ok(()) => UpdateEvent::Installed(rel.tag),
+                Err(e) => UpdateEvent::Failed(format!("update failed: {e:#}")),
+            };
+            let _ = tx.send(ev);
+            busy.store(false, Ordering::Relaxed);
+            dirty.store(true, Ordering::Relaxed);
+        });
+    }
+
+    /// Whether a download is running right now.
+    pub fn update_busy(&self) -> bool {
+        self.update_busy.load(Ordering::Relaxed)
+    }
+
+    fn poll_update(&mut self) {
+        while let Ok(ev) = self.update_rx.try_recv() {
+            match ev {
+                UpdateEvent::Found(rel) => {
+                    // Said once per release, not on every six-hour check.
+                    if self.release.as_ref().map(|r| &r.tag) != Some(&rel.tag) {
+                        self.notify(format!("{} is out — i installs it", rel.tag));
+                    }
+                    self.release = Some(rel);
+                }
+                UpdateEvent::Installed(tag) => {
+                    self.release = None;
+                    self.update_ready = true;
+                    self.origin_stamp = supervise::origin_stamp();
+                    self.notify(format!("{tag} installed — r restarts into it"));
+                    // Straight into the restart when the list is what is on
+                    // screen; from inside a pane the question would land on
+                    // someone typing.
+                    if self.mode == Mode::Nav {
+                        self.request_restart();
+                    }
+                }
+                UpdateEvent::Failed(e) => self.notify(e),
+            }
+        }
+        let due = self
+            .last_update_check
+            .is_none_or(|at| at.elapsed() >= UPDATE_CHECK);
+        if due && config::check_updates() {
+            self.check_for_update();
+        }
+    }
+
     /// Reopen what a previous run left behind, carrying on the conversations
     /// it was holding wherever their transcripts could be found.
     pub fn restore_sessions(&mut self, items: Vec<supervise::Restore>) -> Result<()> {
@@ -767,6 +897,8 @@ impl App {
                 self.notify("new build ready — r restarts the fleet");
             }
         }
+
+        self.poll_update();
 
         if self.last_registry_scan.elapsed() >= REGISTRY_REFRESH {
             self.registry = registry::read_all();

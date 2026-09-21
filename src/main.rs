@@ -15,6 +15,7 @@ mod session;
 mod supervise;
 mod theme;
 mod ui;
+mod update;
 mod usage;
 
 use std::{
@@ -1066,6 +1067,8 @@ fn handle_nav(app: &mut App, key: KeyEvent) {
                 app.notify("asking Claude Code for fresh limits");
             }
         }
+        // `U` would read better, but it has belonged to the limits for longer.
+        KeyCode::Char('i') => app.install_update(),
         KeyCode::Char('?') => app.mode = Mode::Help,
         _ => {}
     }

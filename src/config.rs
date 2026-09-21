@@ -31,6 +31,7 @@ pub struct Config {
     pub labels: Labels,
     pub understand: Understand,
     pub timings: Timings,
+    pub updates: Updates,
 }
 
 /// Colours as written in the file: `#RRGGBB`, or a named terminal colour.
@@ -178,6 +179,19 @@ impl Default for Timings {
         Self {
             finished_ttl_secs: 60,
         }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Updates {
+    /// Whether GitHub is asked about a newer release.
+    pub check: bool,
+}
+
+impl Default for Updates {
+    fn default() -> Self {
+        Self { check: true }
     }
 }
 
@@ -333,6 +347,13 @@ pub fn understand_window() -> Duration {
     Duration::from_millis(ms)
 }
 
+pub fn check_updates() -> bool {
+    CURRENT
+        .read()
+        .map(|c| c.cfg.updates.check)
+        .unwrap_or_else(|_| Updates::default().check)
+}
+
 pub fn finished_ttl() -> Duration {
     let secs = CURRENT
         .read()
@@ -422,6 +443,11 @@ window_ms = 2000
 [timings]
 # After how many seconds a finished session's card disappears.
 finished_ttl_secs = 60
+
+[updates]
+# Ask GitHub every few hours whether a newer release is out. Nothing is
+# downloaded until `i` is pressed.
+check = true
 "##;
 
 #[cfg(test)]
@@ -485,6 +511,7 @@ mod tests {
         assert_eq!(cfg.labels.waiting, "question");
         assert_eq!(cfg.understand.prompt, "understand project");
         assert_eq!(cfg.timings.finished_ttl_secs, 60);
+        assert!(cfg.updates.check);
         assert_eq!(cfg.theme.resolve().ask, Color::Rgb(0x5C, 0x9F, 0xD8));
     }
 

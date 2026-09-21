@@ -166,6 +166,22 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         ])));
     }
 
+    if let Some(rel) = app.release.as_ref().filter(|_| !app.update_ready) {
+        let (label, key) = if app.update_busy() {
+            (format!("{} downloading", rel.tag), "")
+        } else {
+            (format!("{} available", rel.tag), "i")
+        };
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(" ^ ", Style::default().fg(theme::ask())),
+            Span::styled(label.clone(), Style::default().fg(theme::ask()).bold()),
+            Span::raw(" ".repeat(
+                (SIDEBAR_WIDTH as usize).saturating_sub(3 + label.chars().count() + 3),
+            )),
+            Span::styled(key, Style::default().fg(theme::ask())),
+        ])));
+    }
+
     if app.update_ready {
         items.push(ListItem::new(Line::from(vec![
             Span::styled(" ^ ", Style::default().fg(theme::ask())),
@@ -565,6 +581,15 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             ("u", "understand project"),
             ("q", "quit"),
         ],
+        Mode::Nav if app.release.is_some() && !app.update_busy() => vec![
+            ("i", "INSTALL THE NEW RELEASE"),
+            ("up/dn", "select"),
+            ("enter", "focus"),
+            ("n", "new"),
+            ("u", "understand project"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
         Mode::Nav => vec![
             ("up/dn", "select"),
             ("enter", "focus"),
@@ -874,6 +899,8 @@ fn draw_help(f: &mut Frame) {
         ("", "(finished ones go by themselves after a minute)"),
         ("r", "restart into a new build (when a newer exe exists)"),
         ("", "(sessions come back with their conversations, --resume)"),
+        ("i", "install a newer release from GitHub, then restart"),
+        ("", "(checked every few hours; [updates] in fleet.toml)"),
         ("R", "resume an old conversation (transcript list)"),
         ("U", "refresh the account limits now"),
         ("", "(a hidden /usage session, no tokens)"),

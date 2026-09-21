@@ -90,6 +90,7 @@ transcript instead.
 | `U` | refresh the account limits now (see below) |
 | `u` | understand project (see below) |
 | `r` | restart into a new build (see below) |
+| `i` | install a newer release from GitHub (see below) |
 | `x` | kill the selected session (with a confirmation) |
 | `w` | close a finished session's card right away |
 | `?` | help |
@@ -341,6 +342,33 @@ described under "Live changes", copy it once next to `target` and run that
 copy.
 
 On the `x86_64-pc-windows-gnu` toolchain, see "Build environment" below.
+
+## Updates
+
+A fleet started from a downloaded `claude-fleet.exe` asks the GitHub API for
+the latest release at startup and every six hours after. When there is a newer
+one the sidebar shows `^ v0.2.0 available`, and `i` downloads it, puts it in
+place of the exe the fleet was started from and asks for the usual restart —
+sessions come back with their conversations. The exe that was running is moved
+aside as `claude-fleet.old-<ms>.exe` (a running file cannot be overwritten on
+Windows, only renamed) and swept on a later start.
+
+Requests go through the `curl.exe` that ships with Windows. A fleet running out
+of `target/release` or `target/debug` never updates itself: that file belongs
+to cargo. To switch the check off:
+
+```toml
+[updates]
+check = false
+```
+
+### Cutting a release
+
+Bump `version` in `Cargo.toml`, run `cargo build` so `Cargo.lock` follows, and
+merge to `main`. The `Release` workflow sees a version with no release behind
+it, runs the tests, builds, tags `v<version>` and publishes the release with
+`claude-fleet.exe` attached. A push that leaves the version alone releases
+nothing; the workflow can also be started by hand from the Actions tab.
 
 ## Account limits
 
