@@ -844,7 +844,13 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             ("F11", "new"),
             ("F12", "help"),
         ],
-        Mode::NewSession => vec![("enter", "start"), ("up/dn", "recent"), ("esc", "cancel")],
+        Mode::NewSession => vec![
+            ("enter", "start"),
+            ("up/dn", "pick"),
+            ("right", "enter dir"),
+            ("left", "parent"),
+            ("esc", "cancel"),
+        ],
         Mode::Help => vec![("any key", "close")],
         Mode::ConfirmKill => vec![("y", "yes"), ("n/esc", "no")],
         Mode::ConfirmMkdir => vec![("y/enter", "create it"), ("n/esc", "back to the path")],
@@ -900,7 +906,8 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 fn draw_new_session(f: &mut Frame, app: &App) {
     let Some(form) = &app.form else { return };
 
-    let height = (form.recent.len() as u16).min(12) + 6;
+    let subdir_rows = if form.subdirs.is_empty() { 0 } else { form.subdirs.len() as u16 + 2 };
+    let height = (form.recent.len() as u16).min(12) + subdir_rows + 6;
     let area = centered(70, height, f.area());
     f.render_widget(Clear, area);
 
@@ -926,15 +933,45 @@ fn draw_new_session(f: &mut Frame, app: &App) {
                 Style::default().fg(theme::accent()),
             ),
         ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            " recent projects:",
-            Style::default().fg(theme::muted()),
-        )),
     ];
 
+    if !form.subdirs.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            " subfolders:  (right/tab enter · left up)",
+            Style::default().fg(theme::muted()),
+        )));
+        for (i, p) in form.subdirs.iter().enumerate() {
+            let selected = form.cursor == i + 1;
+            let label = p
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.display().to_string());
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { " > " } else { "   " },
+                    Style::default().fg(theme::accent()),
+                ),
+                Span::styled(
+                    format!("{}{}", truncate(&label, 60), std::path::MAIN_SEPARATOR),
+                    if selected {
+                        Style::default().fg(theme::text()).bold()
+                    } else {
+                        Style::default().fg(theme::text())
+                    },
+                ),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " recent projects:",
+        Style::default().fg(theme::muted()),
+    )));
+
     for (i, p) in form.recent.iter().take(12).enumerate() {
-        let selected = form.cursor == i + 1;
+        let selected = form.cursor == form.subdirs.len() + i + 1;
         let label = p
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())

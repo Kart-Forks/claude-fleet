@@ -1192,11 +1192,14 @@ fn handle_form(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         KeyCode::Up => form.move_cursor(-1),
         KeyCode::Down => form.move_cursor(1),
-        KeyCode::Backspace if form.cursor == 0 => {
-            form.input.pop();
-        }
+        // Browse the tree without leaving the form: right/tab steps into the
+        // highlighted subdirectory (or the single match of what was typed),
+        // left steps back up to the parent.
+        KeyCode::Right | KeyCode::Tab => form.descend(),
+        KeyCode::Left => form.ascend(),
+        KeyCode::Backspace if form.cursor == 0 => form.pop(),
         KeyCode::Char(c) if form.cursor == 0 && !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            form.input.push(c);
+            form.push(c);
         }
         _ => {}
     }
@@ -1259,7 +1262,7 @@ fn handle_paste(app: &mut App, text: &str, keep_open: bool) {
         if let Some(form) = app.form.as_mut()
             && form.cursor == 0
         {
-            form.input.push_str(text.trim());
+            form.push_str(text.trim());
             app.dirty.store(true, Ordering::Relaxed);
         }
         return;

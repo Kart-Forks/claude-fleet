@@ -112,31 +112,133 @@ impl ResumePicker {
 
 pub struct NewSessionForm {
     pub input: String,
+    /// Subdirectories under the typed path, for browsing with the arrows.
+    /// Refreshed on every edit: a path that ends at a directory lists its
+    /// children, an unfinished last component filters its parent's.
+    pub subdirs: Vec<PathBuf>,
     pub recent: Vec<PathBuf>,
-    /// `0` is the free-text field; `n` selects `recent[n - 1]`.
+    /// `0` is the free-text field; `1..=subdirs.len()` selects a subdirectory;
+    /// past that selects `recent[n - subdirs.len() - 1]`.
     pub cursor: usize,
 }
 
+/// How many subdirectories the form lists before cutting off.
+const SUBDIR_LIMIT: usize = 10;
+
 impl NewSessionForm {
     fn new(default_cwd: &std::path::Path) -> Self {
-        Self {
+        let mut form = Self {
             input: default_cwd.display().to_string(),
+            subdirs: Vec::new(),
             recent: registry::recent_cwds(12),
             cursor: 0,
-        }
+        };
+        form.refresh_subdirs();
+        form
     }
 
     pub fn selected_path(&self) -> PathBuf {
         if self.cursor == 0 {
             PathBuf::from(self.input.trim())
+        } else if let Some(p) = self.subdirs.get(self.cursor - 1) {
+            p.clone()
         } else {
-            self.recent[self.cursor - 1].clone()
+            self.recent[self.cursor - 1 - self.subdirs.len()].clone()
         }
     }
 
+    /// The subdirectory under the cursor, if the cursor is on one.
+    pub fn selected_subdir(&self) -> Option<&PathBuf> {
+        (self.cursor > 0).then(|| self.subdirs.get(self.cursor - 1)).flatten()
+    }
+
     pub fn move_cursor(&mut self, delta: isize) {
-        let max = self.recent.len() as isize;
+        let max = (self.subdirs.len() + self.recent.len()) as isize;
         self.cursor = (self.cursor as isize + delta).clamp(0, max) as usize;
+    }
+
+    pub fn push(&mut self, c: char) {
+        self.input.push(c);
+        self.refresh_subdirs();
+    }
+
+    pub fn push_str(&mut self, s: &str) {
+        self.input.push_str(s);
+        self.refresh_subdirs();
+    }
+
+    pub fn pop(&mut self) {
+        self.input.pop();
+        self.refresh_subdirs();
+    }
+
+    /// Make the directory under the cursor (or the only match of what was
+    /// typed) the input, ready to browse one level deeper.
+    pub fn descend(&mut self) {
+        let target = match self.selected_subdir() {
+            Some(p) => p.clone(),
+            None if self.cursor == 0 && self.subdirs.len() == 1 => self.subdirs[0].clone(),
+            None => return,
+        };
+        self.input = format!("{}{}", target.display(), std::path::MAIN_SEPARATOR);
+        self.cursor = 0;
+        self.refresh_subdirs();
+    }
+
+    /// Step the input up to the parent of the directory it names.
+    pub fn ascend(&mut self) {
+        let (dir, _) = self.split_input();
+        let Some(parent) = dir.parent() else { return };
+        if parent.as_os_str().is_empty() {
+            return;
+        }
+        self.input = format!("{}{}", parent.display(), std::path::MAIN_SEPARATOR);
+        self.cursor = 0;
+        self.refresh_subdirs();
+    }
+
+    /// The directory to list and the prefix its children must start with.
+    fn split_input(&self) -> (PathBuf, String) {
+        let raw = self.input.trim();
+        let path = PathBuf::from(raw);
+        let ends_in_sep = raw.ends_with(['/', '\\']);
+        if ends_in_sep || path.is_dir() {
+            return (path, String::new());
+        }
+        let prefix = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let dir = path.parent().map(PathBuf::from).unwrap_or(path);
+        (dir, prefix)
+    }
+
+    fn refresh_subdirs(&mut self) {
+        let (dir, prefix) = self.split_input();
+        let prefix = prefix.to_lowercase();
+        let mut found: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        let name = p
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_lowercase())
+                            .unwrap_or_default();
+                        !name.starts_with('.') && name.starts_with(&prefix)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        found.sort_by_key(|p| {
+            p.file_name()
+                .map(|s| s.to_string_lossy().to_lowercase())
+                .unwrap_or_default()
+        });
+        found.truncate(SUBDIR_LIMIT);
+        self.subdirs = found;
+        self.cursor = self.cursor.min(self.subdirs.len() + self.recent.len());
     }
 }
 
