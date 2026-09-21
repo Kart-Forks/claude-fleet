@@ -362,13 +362,15 @@ to cargo. To switch the check off:
 check = false
 ```
 
-### Cutting a release
+### Releases
 
-Bump `version` in `Cargo.toml`, run `cargo build` so `Cargo.lock` follows, and
-merge to `main`. The `Release` workflow sees a version with no release behind
-it, runs the tests, builds, tags `v<version>` and publishes the release with
-`claude-fleet.exe` attached. A push that leaves the version alone releases
-nothing; the workflow can also be started by hand from the Actions tab.
+Every push to `main` that changes the program is released by the `Release`
+workflow: tested, built, tagged and published with `claude-fleet.exe`
+attached. Pushes that only touch Markdown and repo housekeeping are skipped.
+
+The version is the next patch after the newest `v*` tag. For a minor or major
+step, set `version` in `Cargo.toml` above that tag and it is used instead. The
+number is stamped into the build only; nothing is committed back.
 
 ## Account limits
 

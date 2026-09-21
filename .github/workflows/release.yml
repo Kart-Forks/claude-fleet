@@ -1,12 +1,15 @@
 name: Release
 
-# A release is cut whenever `version` in Cargo.toml names one that does not
-# exist yet: bump the version, merge to main, and the tag, the build and the
-# release follow. Running fleets find it through the GitHub API.
+# Every push to main that changes the program is released on its own.
+#
+# The version is the next patch after the newest `v*` tag. To move the minor
+# or major number, set `version` in Cargo.toml above the newest tag and that
+# is used instead. The number is written into Cargo.toml only for the build,
+# so the binary knows what it is; nothing is committed back.
 on:
   push:
     branches: [main]
-    paths: [Cargo.toml]
+    paths-ignore: ["**.md", "LICENSE", ".gitignore", ".gitattributes", ".github/workflows/ci.yml"]
   workflow_dispatch:
 
 permissions:
@@ -21,22 +24,41 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Read the version
+      - name: Pick the version
         id: version
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
-          tag="v$version"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "$tag is already released"
+          if [ -n "$(git tag --points-at HEAD 'v*')" ]; then
+            echo "this commit is already released"
             echo "new=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "new=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          declared=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          latest=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 | sed 's/^v//')
+          if [ -z "$latest" ]; then
+            version="$declared"
+          else
+            IFS=. read -r ma mi pa <<< "$latest"
+            bumped="$ma.$mi.$((pa + 1))"
+            # Whichever is higher: the next patch, or what Cargo.toml asks for.
+            version=$(printf '%s\n%s\n' "$bumped" "$declared" | sort -V | tail -n1)
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "new=true" >> "$GITHUB_OUTPUT"
+          echo "releasing v$version"
+
+      - name: Stamp the version into the build
+        if: steps.version.outputs.new == 'true'
+        shell: bash
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          sed -i -E "0,/^version = \".*\"/s//version = \"$v\"/" Cargo.toml
+          perl -0pi -e "s/(name = \"claude-fleet\"\nversion = )\"[^\"]*\"/\${1}\"$v\"/" Cargo.lock
+          grep -m1 '^version' Cargo.toml
 
       - uses: dtolnay/rust-toolchain@stable
         if: steps.version.outputs.new == 'true'
