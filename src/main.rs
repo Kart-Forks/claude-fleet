@@ -7,6 +7,7 @@
 mod app;
 mod config;
 mod dsr;
+mod git;
 mod history;
 mod input;
 mod keys;
@@ -905,7 +906,7 @@ fn drain_key_burst(input: &Input, first: char) -> Burst {
 /// Keep every PTY the same size as the pane, so switching sessions never shows
 /// a stale layout.
 fn sync_pane_size(terminal: &Tui, app: &mut App) -> Result<()> {
-    let area = ui::pane_area(terminal.size()?.into());
+    let area = ui::pane_area(terminal.size()?.into(), app.show_git);
     let inner = ui::pane_inner_rect(area);
     app.pane_x = inner.x;
     app.pane_y = inner.y;
@@ -1069,6 +1070,7 @@ fn handle_nav(app: &mut App, key: KeyEvent) {
         }
         // `U` would read better, but it has belonged to the limits for longer.
         KeyCode::Char('i') => app.install_update(),
+        KeyCode::Char('g') => app.toggle_git(),
         KeyCode::Char('?') => app.mode = Mode::Help,
         _ => {}
     }
@@ -1219,6 +1221,10 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
     if m.column < app.pane_x {
         app.select(if up { -1 } else { 1 });
         app.dirty.store(true, Ordering::Relaxed);
+        return;
+    }
+    // Past the pane's right border is the git panel, which does not scroll.
+    if m.column > app.pane_x + app.pane_cols {
         return;
     }
 

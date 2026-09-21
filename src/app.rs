@@ -12,7 +12,7 @@ use std::{
 use anyhow::Result;
 
 use crate::{
-    config, history,
+    config, git, history,
     registry::{self, RegistryEntry},
     session::{label_for, PtySession},
     supervise, update, usage,
@@ -23,6 +23,11 @@ use crate::{
 const RESUME_LIMIT: usize = 20;
 
 const REGISTRY_REFRESH: Duration = Duration::from_millis(750);
+
+/// How often the git panel reads the selected session's repository again.
+/// Sessions commit and edit files on their own, and the panel should catch up
+/// while one watches, but a `git status` is still a process.
+const GIT_REFRESH: Duration = Duration::from_secs(2);
 
 /// How often the binary this fleet was started from is checked for a rebuild.
 /// It is one `stat` and nobody rebuilds twice a second.
@@ -198,6 +203,17 @@ pub struct App {
     /// which is the difference between asking every six minutes and every half
     /// hour.
     spent_since_refresh: bool,
+    /// Whether the git panel is on screen. Toggled with `g`.
+    pub show_git: bool,
+    /// The last git read, and the directory it was made in. The panel shows it
+    /// only while that is still the selected session's directory.
+    pub git: Option<(PathBuf, git::State)>,
+    /// Set while a git read is running, so only one runs at a time.
+    git_busy: Arc<AtomicBool>,
+    git_tx: mpsc::Sender<(PathBuf, git::State)>,
+    git_rx: mpsc::Receiver<(PathBuf, git::State)>,
+    /// When the last read was started, and for which directory.
+    last_git_read: Option<(PathBuf, Instant)>,
 }
 
 /// What the update thread reports back.
@@ -213,6 +229,7 @@ impl App {
             update::sweep(&origin);
         }
         let (update_tx, update_rx) = mpsc::channel();
+        let (git_tx, git_rx) = mpsc::channel();
         Self {
             sessions: Vec::new(),
             selected: 0,
@@ -245,6 +262,12 @@ impl App {
             usage_refreshing: Arc::new(AtomicBool::new(false)),
             last_usage_refresh: None,
             spent_since_refresh: false,
+            show_git: true,
+            git: None,
+            git_busy: Arc::new(AtomicBool::new(false)),
+            git_tx,
+            git_rx,
+            last_git_read: None,
             origin_stamp: supervise::origin_stamp(),
             last_exe_check: Instant::now(),
         }
@@ -561,6 +584,59 @@ impl App {
             }
             busy.store(false, Ordering::Relaxed);
             dirty.store(true, Ordering::Relaxed);
+        });
+    }
+
+    /// The directory the git panel is about: the selected session's, or the
+    /// one the fleet was started in when there are no sessions.
+    pub fn git_target(&self) -> PathBuf {
+        self.default_cwd()
+    }
+
+    /// The git read for the directory the panel is about, if one has come back
+    /// for it yet.
+    pub fn git_state(&self) -> Option<&git::State> {
+        let target = self.git_target();
+        self.git
+            .as_ref()
+            .filter(|(cwd, _)| *cwd == target)
+            .map(|(_, state)| state)
+    }
+
+    pub fn toggle_git(&mut self) {
+        self.show_git = !self.show_git;
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Take in finished reads, and start the next one when the selection has
+    /// moved to another directory or the last read has aged.
+    fn poll_git(&mut self) {
+        while let Ok((cwd, state)) = self.git_rx.try_recv() {
+            if self.git.as_ref() != Some(&(cwd.clone(), state.clone())) {
+                self.git = Some((cwd, state));
+                self.dirty.store(true, Ordering::Relaxed);
+            }
+        }
+        if !self.show_git {
+            return;
+        }
+        let target = self.git_target();
+        let due = match &self.last_git_read {
+            Some((cwd, at)) => *cwd != target || at.elapsed() >= GIT_REFRESH,
+            None => true,
+        };
+        if !due || self.git_busy.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        self.last_git_read = Some((target.clone(), Instant::now()));
+        let busy = Arc::clone(&self.git_busy);
+        let tx = self.git_tx.clone();
+        // No redraw from here: `tick` runs every frame and redraws only when
+        // what came back differs from what is on screen.
+        std::thread::spawn(move || {
+            let state = git::read(&target);
+            let _ = tx.send((target, state));
+            busy.store(false, Ordering::Relaxed);
         });
     }
 
@@ -899,6 +975,7 @@ impl App {
         }
 
         self.poll_update();
+        self.poll_git();
 
         if self.last_registry_scan.elapsed() >= REGISTRY_REFRESH {
             self.registry = registry::read_all();

@@ -1,7 +1,7 @@
 //! All rendering. The pane is a `tui-term` widget over the session's vt100
 //! screen; everything else is chrome drawn around it.
 
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
@@ -14,10 +14,18 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::{
     app::{App, Mode},
-    config, theme, usage,
+    config, git, theme, usage,
 };
 
 pub const SIDEBAR_WIDTH: u16 = 36;
+
+/// The git panel on the right. Wide enough for a hash, most of a commit
+/// subject and its age.
+pub const GIT_WIDTH: u16 = 44;
+
+/// The narrowest the terminal pane may get before the git panel steps aside
+/// for it: Claude Code's own layout starts breaking up below about this.
+const PANE_MIN_WITH_GIT: u16 = 70;
 
 /// Columns kept clear either side of a limit bar, so it never runs into the
 /// sidebar's border.
@@ -35,11 +43,13 @@ const USAGE_STALE: Duration = Duration::from_secs(20 * 60);
 pub fn draw(f: &mut Frame, app: &mut App) {
     let [body, status] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(f.area());
-    let [sidebar, pane] =
-        Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(20)]).areas(body);
+    let (sidebar, pane, git) = columns(body, app.show_git);
 
     draw_sidebar(f, app, sidebar);
     draw_pane(f, app, pane);
+    if let Some(git) = git {
+        draw_git(f, app, git);
+    }
     draw_status(f, app, status);
 
     match app.mode {
@@ -60,11 +70,26 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
 /// The pane rectangle for a given terminal size, so the event loop can resize
 /// PTYs without waiting for a render.
-pub fn pane_area(full: Rect) -> Rect {
+pub fn pane_area(full: Rect, show_git: bool) -> Rect {
     let [body, _] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(full);
-    let [_, pane] =
+    columns(body, show_git).1
+}
+
+/// Sidebar, pane, and the git panel when it is wanted and there is room for
+/// it next to a pane still worth typing into.
+fn columns(body: Rect, show_git: bool) -> (Rect, Rect, Option<Rect>) {
+    if show_git && body.width >= SIDEBAR_WIDTH + PANE_MIN_WITH_GIT + GIT_WIDTH {
+        let [sidebar, pane, git] = Layout::horizontal([
+            Constraint::Length(SIDEBAR_WIDTH),
+            Constraint::Min(20),
+            Constraint::Length(GIT_WIDTH),
+        ])
+        .areas(body);
+        return (sidebar, pane, Some(git));
+    }
+    let [sidebar, pane] =
         Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(20)]).areas(body);
-    pane
+    (sidebar, pane, None)
 }
 
 /// Inner size of the terminal pane, which is what a PTY must be resized to.
@@ -562,6 +587,218 @@ fn draw_pane(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(term, area);
 }
 
+/// The repository the selected session works in: branch, what is not
+/// committed yet, and the history. It follows the selection, so switching
+/// sessions switches repositories.
+fn draw_git(f: &mut Frame, app: &App, area: Rect) {
+    let target = app.git_target();
+    let state = app.git_state();
+
+    let mut title = vec![Span::styled(" GIT ", Style::default().fg(theme::accent()).bold())];
+    if let Some(git::State::Repo(snap)) = state
+        && let Some(name) = snap.root.file_name()
+    {
+        title.push(Span::styled(
+            format!("{} ", truncate(&name.to_string_lossy(), GIT_WIDTH as usize - 10)),
+            Style::default().fg(theme::muted()),
+        ));
+    }
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::faint()))
+        .title(Line::from(title))
+        .title_bottom(Line::from(Span::styled(
+            " g hides ",
+            Style::default().fg(theme::faint()),
+        )));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let width = inner.width as usize;
+    let lines = match state {
+        None => vec![
+            Line::from(""),
+            Line::from(Span::styled(" reading…", Style::default().fg(theme::faint()))),
+        ],
+        Some(git::State::NoGit) => vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                " git is not on PATH",
+                Style::default().fg(theme::muted()),
+            )),
+        ],
+        Some(git::State::NotARepo) => vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                " not a git repository",
+                Style::default().fg(theme::muted()),
+            )),
+            Line::from(Span::styled(
+                format!(" {}", shorten_path(&target, width.saturating_sub(2))),
+                Style::default().fg(theme::faint()),
+            )),
+        ],
+        Some(git::State::Repo(snap)) => {
+            // Commits made since the session started happened while it was
+            // running — most likely its own work — and get a mark.
+            let since = app
+                .selected_session()
+                .map(|s| SystemTime::now() - s.started.elapsed());
+            git_lines(snap, since, width, inner.height as usize)
+        }
+    };
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The panel's rows for a repository, fitted to `height`.
+///
+/// The changes get up to a third of the panel and the history the rest: the
+/// changes are what one glances at, the history is what fills the column.
+fn git_lines(
+    snap: &git::Snapshot,
+    since: Option<SystemTime>,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![branch_line(snap, width), Line::from("")];
+
+    // What is not committed yet.
+    if snap.changes_total == 0 {
+        lines.push(Line::from(vec![
+            Span::styled(" CHANGES", Style::default().fg(theme::muted())),
+            Span::raw(" ".repeat(width.saturating_sub(" CHANGES".len() + "clean ".len()))),
+            Span::styled("clean ", Style::default().fg(theme::idle())),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!(" CHANGES {}", snap.changes_total),
+            Style::default().fg(theme::muted()),
+        )));
+        let room = (height / 3).max(3);
+        // The "+N more" row takes the place of the last file it stands for.
+        let shown = if snap.changes_total > room { room - 1 } else { room };
+        for c in snap.changes.iter().take(shown) {
+            lines.push(change_line(c, width));
+        }
+        if snap.changes_total > shown {
+            lines.push(Line::from(Span::styled(
+                format!("   +{} more", snap.changes_total - shown),
+                Style::default().fg(theme::faint()),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled(
+        " HISTORY",
+        Style::default().fg(theme::muted()),
+    )));
+    if snap.log.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   no commits yet",
+            Style::default().fg(theme::faint()),
+        )));
+    }
+    let now = SystemTime::now();
+    let room = height.saturating_sub(lines.len());
+    for (i, c) in snap.log.iter().take(room).enumerate() {
+        lines.push(commit_line(c, i, snap, since, now, width));
+    }
+    lines
+}
+
+/// The branch, and how it stands against its upstream.
+fn branch_line(snap: &git::Snapshot, width: usize) -> Line<'static> {
+    let branch = match (&snap.branch, snap.log.first()) {
+        (Some(b), _) => b.clone(),
+        (None, Some(c)) => format!("detached at {}", c.hash),
+        (None, None) => "detached".to_string(),
+    };
+    let mut sync = String::new();
+    if snap.ahead > 0 {
+        sync.push_str(&format!("\u{2191}{} ", snap.ahead));
+    }
+    if snap.behind > 0 {
+        sync.push_str(&format!("\u{2193}{} ", snap.behind));
+    }
+    if snap.upstream.is_none() {
+        sync.push_str("no upstream ");
+    } else if sync.is_empty() {
+        sync.push_str("in sync ");
+    }
+    let sync_color = if snap.behind > 0 {
+        theme::dead()
+    } else if snap.ahead > 0 {
+        theme::ask()
+    } else {
+        theme::faint()
+    };
+    let branch = truncate(&branch, width.saturating_sub(sync.chars().count() + 4));
+    let used = 3 + branch.chars().count() + sync.chars().count();
+    Line::from(vec![
+        Span::styled(" \u{2387} ", Style::default().fg(theme::accent())),
+        Span::styled(branch, Style::default().fg(theme::text()).bold()),
+        Span::raw(" ".repeat(width.saturating_sub(used))),
+        Span::styled(sync, Style::default().fg(sync_color)),
+    ])
+}
+
+/// One changed file: its porcelain code coloured by what happened to it, and
+/// the path cut from the left, since the file name is the end worth keeping.
+fn change_line(c: &git::Change, width: usize) -> Line<'static> {
+    let color = match c.code.as_str() {
+        "??" => theme::faint(),
+        code if code.contains('U') => theme::ask(),
+        code if code.contains('D') => theme::dead(),
+        _ if c.staged() => theme::idle(),
+        _ => theme::busy(),
+    };
+    Line::from(vec![
+        Span::raw("   "),
+        Span::styled(c.code.clone(), Style::default().fg(color).bold()),
+        Span::raw(" "),
+        Span::styled(
+            truncate_left(&c.path, width.saturating_sub(6)),
+            Style::default().fg(theme::text()),
+        ),
+    ])
+}
+
+/// One commit: a mark for the ones made during the session, the hash (in the
+/// warning colour while it is not pushed yet), the subject, and its age.
+fn commit_line(
+    c: &git::Commit,
+    index: usize,
+    snap: &git::Snapshot,
+    since: Option<SystemTime>,
+    now: SystemTime,
+    width: usize,
+) -> Line<'static> {
+    let at = UNIX_EPOCH + Duration::from_secs(c.time);
+    let fresh = since.is_some_and(|t| at >= t);
+    // The log starts at HEAD, so the first `ahead` of it are what the
+    // upstream has not got.
+    let unpushed = snap.upstream.is_some() && index < snap.ahead as usize;
+    let age = fmt_age(now, at);
+    // Mark, hash, the gaps and the age are fixed; the subject takes the rest.
+    let fixed = 2 + c.hash.chars().count() + 1 + 1 + age.chars().count() + 1;
+    let subject = truncate(&c.subject, width.saturating_sub(fixed));
+    let pad = width.saturating_sub(fixed + subject.chars().count());
+    let hash_color = if unpushed { theme::ask() } else { theme::accent_dim() };
+    Line::from(vec![
+        Span::styled(
+            if fresh { " \u{2022}" } else { "  " },
+            Style::default().fg(theme::accent()),
+        ),
+        Span::styled(c.hash.clone(), Style::default().fg(hash_color)),
+        Span::raw(" "),
+        Span::styled(subject, Style::default().fg(theme::text())),
+        Span::raw(" ".repeat(pad + 1)),
+        Span::styled(age, Style::default().fg(theme::faint())),
+        Span::raw(" "),
+    ])
+}
+
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     if let Some((msg, _)) = &app.status {
         let p = Paragraph::new(Line::from(vec![
@@ -596,6 +833,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             ("n", "new"),
             ("R", "resume a conversation"),
             ("u", "understand project"),
+            ("g", "git panel"),
             ("x", "kill"),
             ("?", "help"),
             ("q", "quit"),
@@ -902,6 +1140,9 @@ fn draw_help(f: &mut Frame) {
         ("i", "install a newer release from GitHub, then restart"),
         ("", "(checked every few hours; [updates] in fleet.toml)"),
         ("R", "resume an old conversation (transcript list)"),
+        ("g", "show or hide the git panel on the right"),
+        ("", "(the selected session's repository: branch,"),
+        ("", " changes, history; \u{2022} = made during the session)"),
         ("U", "refresh the account limits now"),
         ("", "(a hidden /usage session, no tokens)"),
         ("q", "quit"),
@@ -993,12 +1234,17 @@ pub fn truncate(s: &str, max: usize) -> String {
 }
 
 fn shorten_path(p: &std::path::Path, max: usize) -> String {
-    let full = p.display().to_string();
-    let len = full.chars().count();
+    truncate_left(&p.display().to_string(), max)
+}
+
+/// `truncate` from the other end: the tail is kept, since that is where a
+/// path's file name is.
+fn truncate_left(s: &str, max: usize) -> String {
+    let len = s.chars().count();
     if len <= max {
-        return full;
+        return s.to_string();
     }
-    let tail: String = full.chars().skip(len - max.saturating_sub(1)).collect();
+    let tail: String = s.chars().skip(len - max.saturating_sub(1)).collect();
     format!("~{tail}")
 }
 
@@ -1069,6 +1315,38 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn git_rows_fit_the_panel_and_its_height() {
+        let snap = git::Snapshot {
+            root: "C:/work/repo".into(),
+            branch: Some("feature/a-branch-name-far-longer-than-the-panel".into()),
+            ahead: 12,
+            behind: 3,
+            upstream: Some("origin/x".into()),
+            changes: (0..50)
+                .map(|i| git::Change {
+                    code: " M".into(),
+                    path: format!("src/some/deeply/nested/directory/file_{i}.rs"),
+                })
+                .collect(),
+            changes_total: 50,
+            log: (0..60)
+                .map(|i| git::Commit {
+                    hash: "41c45ad".into(),
+                    subject: "a subject line that goes on well past the panel's edge".repeat(i % 3 + 1),
+                    time: 1_700_000_000,
+                })
+                .collect(),
+        };
+        let width = usize::from(GIT_WIDTH) - 2;
+        let height = 40;
+        let lines = git_lines(&snap, Some(SystemTime::now()), width, height);
+        assert!(lines.len() <= height, "{} rows for {height}", lines.len());
+        for l in &lines {
+            assert!(l.width() <= width, "a row takes {} of {width}", l.width());
         }
     }
 

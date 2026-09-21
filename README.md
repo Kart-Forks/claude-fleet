@@ -93,8 +93,22 @@ transcript instead.
 | `i` | install a newer release from GitHub (see below) |
 | `x` | kill the selected session (with a confirmation) |
 | `w` | close a finished session's card right away |
+| `g` | show or hide the git panel (see below) |
 | `?` | help |
 | `q` | quit |
+
+## Git panel
+
+The column on the right follows the selected session: it shows the
+repository that session works in — the branch and how it stands against its
+upstream (`↑` ahead, `↓` behind), the uncommitted changes, and the history.
+Switch sessions and it switches repositories.
+
+In the history, `•` marks commits made while the session was running, and a
+hash in the warning colour is one not pushed yet. The panel reads `git
+status` and `git log` every two seconds with `GIT_OPTIONAL_LOCKS=0`, so it
+never holds the index lock a session wants for its own commit. It steps
+aside on its own when the terminal is too narrow to keep the pane usable.
 
 ## Session state on a card
 
